@@ -35,11 +35,11 @@ except Exception:
 print("✅ All packages ready!")
 
 # ══════════════════════════════════════════════════════════════════════
-#  ⚙️  CONFIG — শুধু এই ২টা line edit করো
+#  ⚙️  CONFIG — Edit only these 2 lines
 # ══════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"   # @BotFather থেকে নাও
-CHAT_ID   = 0  # Replace with your chat ID               # @userinfobot থেকে নাও (integer)
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"   # Get from @BotFather
+CHAT_ID   = 0  # Replace with your chat ID (integer) from @userinfobot
 
 DEFAULT_WATCHLIST = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT",
@@ -98,8 +98,8 @@ log = logging.getLogger("signal_bot")
 
 _COIN_RE = re.compile(r"^[A-Z]{2,10}$")
 def is_valid_coin(c): return bool(_COIN_RE.match(c))
-def s2coin(s):        return s.replace("/USDT","")
-def coin2s(c):
+def symbol_to_coin(s):        return s.replace("/USDT","")
+def coin_to_symbol(c):
     c = c.upper().replace("USDT","").strip("/")
     return f"{c}/USDT"
 
@@ -126,12 +126,13 @@ class BotState:
                 "rsi_buy":      self.rsi_buy,
                 "rsi_sell":     self.rsi_sell,
             }, indent=2))
-        except Exception as e: log.error(f"Save: {e}")
+        except Exception as e: log.error(f"Save error: {e}")
 
     def load(self):
         try:
             if not Path(STATE_FILE).exists():
-                self.watchlist = list(DEFAULT_WATCHLIST); return
+                self.watchlist = list(DEFAULT_WATCHLIST)
+                return
             d = json.loads(Path(STATE_FILE).read_text())
             self.watchlist    = d.get("watchlist",    list(DEFAULT_WATCHLIST))
             self.active_tf    = d.get("active_tf",    PRIMARY_TF)
@@ -141,7 +142,7 @@ class BotState:
             self.price_alerts = defaultdict(list, d.get("price_alerts", {}))
             log.info(f"State loaded — {len(self.watchlist)} coins")
         except Exception as e:
-            log.error(f"Load: {e}")
+            log.error(f"Load error: {e}")
             self.watchlist = list(DEFAULT_WATCHLIST)
 
 
@@ -156,361 +157,616 @@ async def fetch_ohlcv(symbol: str, tf: str = None) -> Optional[pd.DataFrame]:
     tf = tf or state.active_tf
     try:
         raw = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=CANDLE_LIMIT)
-        if not raw or len(raw) < 60: return None
-        df = pd.DataFrame(raw, columns=["ts","open","high","low","close","volume"])
-        df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-        df.set_index("ts", inplace=True)
+        if not raw or len(raw) < 60: 
+            return None
+        df = pd.DataFrame(raw, columns=["timestamp","open","high","low","close","volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df.set_index("timestamp", inplace=True)
         for col in ["open","high","low","close","volume"]:
             df[col] = df[col].astype(float)
         return df
     except Exception as e:
-        log.error(f"OHLCV [{symbol}]: {e}"); return None
+        log.error(f"OHLCV error [{symbol}]: {e}")
+        return None
 
 async def fetch_price(symbol: str) -> Optional[float]:
     try:
-        t = await exchange.fetch_ticker(symbol)
-        return float(t["last"])
+        ticker = await exchange.fetch_ticker(symbol)
+        return float(ticker["last"])
     except Exception as e:
-        log.error(f"Price [{symbol}]: {e}"); return None
+        log.error(f"Price error [{symbol}]: {e}")
+        return None
 
 async def fetch_fear_greed() -> Optional[int]:
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
                 "https://api.alternative.me/fng/?limit=1",
                 timeout=aiohttp.ClientTimeout(total=5)
-            ) as r:
-                data = await r.json()
+            ) as response:
+                data = await response.json()
                 return int(data["data"][0]["value"])
-    except Exception: return None
+    except Exception:
+        return None
 
 # ══════════════════════════════════════════════════════════════════════
-#  📊  INDICATORS — pure pandas/numpy (pandas_ta নেই)
+#  📊  INDICATORS — pure pandas/numpy (no pandas_ta)
 # ══════════════════════════════════════════════════════════════════════
 
-def calc_rsi(close, period=14):
+def calculate_rsi(close, period=14):
     delta = close.diff()
-    gain  = delta.clip(lower=0)
-    loss  = (-delta).clip(lower=0)
-    ag    = gain.ewm(com=period-1, min_periods=period).mean()
-    al    = loss.ewm(com=period-1, min_periods=period).mean()
-    rs    = ag / al.replace(0, np.nan)
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(com=period-1, min_periods=period).mean()
+    avg_loss = loss.ewm(com=period-1, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     return 100 - (100 / (1 + rs))
 
-def calc_ema(close, period):
+def calculate_ema(close, period):
     return close.ewm(span=period, adjust=False).mean()
 
-def calc_sma(close, period):
+def calculate_sma(close, period):
     return close.rolling(period).mean()
 
-def calc_macd(close, fast=12, slow=26, signal=9):
-    macd  = calc_ema(close,fast) - calc_ema(close,slow)
-    sig   = calc_ema(macd,signal)
-    return macd, sig, macd - sig
+def calculate_macd(close, fast=12, slow=26, signal=9):
+    macd = calculate_ema(close, fast) - calculate_ema(close, slow)
+    signal_line = calculate_ema(macd, signal)
+    return macd, signal_line, macd - signal_line
 
-def calc_bbands(close, period=20, std=2.0):
-    mid   = close.rolling(period).mean()
-    sigma = close.rolling(period).std()
-    return mid + std*sigma, mid, mid - std*sigma
+def calculate_bollinger_bands(close, period=20, std=2.0):
+    middle = close.rolling(period).mean()
+    std_dev = close.rolling(period).std()
+    upper = middle + std * std_dev
+    lower = middle - std * std_dev
+    return upper, middle, lower
 
-def calc_atr(high, low, close, period=14):
-    tr = pd.concat([high-low,
-                    (high-close.shift()).abs(),
-                    (low -close.shift()).abs()], axis=1).max(axis=1)
+def calculate_atr(high, low, close, period=14):
+    tr1 = high - low
+    tr2 = (high - close.shift()).abs()
+    tr3 = (low - close.shift()).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.ewm(com=period-1, min_periods=period).mean()
 
-def calc_adx(high, low, close, period=14):
-    up    = high.diff()
-    down  = -low.diff()
-    plus  = pd.Series(np.where((up>down)&(up>0),  up,   0.0), index=close.index)
-    minus = pd.Series(np.where((down>up)&(down>0), down, 0.0), index=close.index)
-    atr_s = calc_atr(high, low, close, period)
-    dip   = 100 * calc_ema(plus,  period) / atr_s.replace(0,np.nan)
-    dim   = 100 * calc_ema(minus, period) / atr_s.replace(0,np.nan)
-    dx    = 100 * (dip-dim).abs() / (dip+dim).replace(0,np.nan)
-    return calc_ema(dx,period), dip, dim
+def calculate_adx(high, low, close, period=14):
+    up_move = high.diff()
+    down_move = -low.diff()
+    
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=close.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=close.index)
+    
+    atr = calculate_atr(high, low, close, period)
+    
+    plus_di = 100 * calculate_ema(plus_dm, period) / atr.replace(0, np.nan)
+    minus_di = 100 * calculate_ema(minus_dm, period) / atr.replace(0, np.nan)
+    
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = calculate_ema(dx, period)
+    
+    return adx, plus_di, minus_di
 
-def calc_stoch_rsi(close, rsi_p=14, stoch_p=14, k=3, d=3):
-    rsi  = calc_rsi(close, rsi_p)
-    lo   = rsi.rolling(stoch_p).min()
-    hi   = rsi.rolling(stoch_p).max()
-    st   = 100*(rsi-lo)/(hi-lo).replace(0,np.nan)
-    k_l  = st.rolling(k).mean()
-    d_l  = k_l.rolling(d).mean()
-    return k_l, d_l
+def calculate_stoch_rsi(close, rsi_period=14, stoch_period=14, k_smoothing=3, d_smoothing=3):
+    rsi = calculate_rsi(close, rsi_period)
+    lowest_rsi = rsi.rolling(stoch_period).min()
+    highest_rsi = rsi.rolling(stoch_period).max()
+    
+    stoch = 100 * (rsi - lowest_rsi) / (highest_rsi - lowest_rsi).replace(0, np.nan)
+    k_line = stoch.rolling(k_smoothing).mean()
+    d_line = k_line.rolling(d_smoothing).mean()
+    
+    return k_line, d_line
 
-def calc_obv(close, volume):
-    return (np.sign(close.diff()).fillna(0)*volume).cumsum()
+def calculate_obv(close, volume):
+    return (np.sign(close.diff()).fillna(0) * volume).cumsum()
 
-def calc_vwap(high, low, close, volume, period=20):
-    tp = (high+low+close)/3
-    return (tp*volume).rolling(period).sum() / volume.rolling(period).sum()
+def calculate_vwap(high, low, close, volume, period=20):
+    typical_price = (high + low + close) / 3
+    return (typical_price * volume).rolling(period).sum() / volume.rolling(period).sum()
 
-def calc_hammer(open_, high, low, close):
-    body  = (close-open_).abs()
-    lower = open_.combine(close,min) - low
-    upper = high - open_.combine(close,max)
-    return ((lower>=2*body) & (upper<=body*0.5) & (body>0)).astype(int)
+def detect_hammer(open_price, high, low, close):
+    body = (close - open_price).abs()
+    lower_wick = open_price.combine(close, min) - low
+    upper_wick = high - open_price.combine(close, max)
+    
+    return ((lower_wick >= 2 * body) & 
+            (upper_wick <= body * 0.5) & 
+            (body > 0)).astype(int)
 
-def calc_engulfing(open_, close):
-    po = open_.shift(1); pc = close.shift(1)
-    bull = (pc<po) & (close>po) & (open_<pc)
-    bear = (pc>po) & (close<po) & (open_>pc)
-    r = pd.Series(0, index=close.index)
-    r[bull]=1; r[bear]=-1
-    return r
+def detect_engulfing(open_price, close):
+    prev_open = open_price.shift(1)
+    prev_close = close.shift(1)
+    
+    bullish_engulfing = (prev_close < prev_open) & (close > prev_open) & (open_price < prev_close)
+    bearish_engulfing = (prev_close > prev_open) & (close < prev_open) & (open_price > prev_close)
+    
+    result = pd.Series(0, index=close.index)
+    result[bullish_engulfing] = 1
+    result[bearish_engulfing] = -1
+    return result
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    c,h,l,o,v = df["close"],df["high"],df["low"],df["open"],df["volume"]
-    df["rsi"]       = calc_rsi(c, RSI_PERIOD)
-    df["ema_fast"]  = calc_ema(c, EMA_FAST)
-    df["ema_slow"]  = calc_ema(c, EMA_SLOW)
-    df["sma200"]    = calc_sma(c, SMA_TREND)
-    df["atr"]       = calc_atr(h,l,c, ATR_PERIOD)
-    df["obv"]       = calc_obv(c,v)
-    df["macd"], df["macd_sig"], df["macd_hist"] = calc_macd(c,MACD_FAST,MACD_SLOW,MACD_SIGNAL)
-    df["bb_upper"], df["bb_mid"], df["bb_lower"] = calc_bbands(c,BB_PERIOD,BB_STD)
-    df["adx"], df["dmp"], df["dmn"]              = calc_adx(h,l,c,ADX_PERIOD)
-    df["stoch_k"], df["stoch_d"]                 = calc_stoch_rsi(c,RSI_PERIOD,14,3,3)
-    df["vwap"]      = calc_vwap(h,l,c,v,VWAP_PERIOD)
-    df["vol_avg"]   = v.rolling(20).mean()
-    df["vol_ratio"] = v / df["vol_avg"].clip(lower=0.001)
-    df["cdl_hammer"]    = calc_hammer(o,h,l,c)
-    df["cdl_engulfing"] = calc_engulfing(o,c)
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+    open_price = df["open"]
+    volume = df["volume"]
+    
+    df["rsi"] = calculate_rsi(close, RSI_PERIOD)
+    df["ema_fast"] = calculate_ema(close, EMA_FAST)
+    df["ema_slow"] = calculate_ema(close, EMA_SLOW)
+    df["sma200"] = calculate_sma(close, SMA_TREND)
+    df["atr"] = calculate_atr(high, low, close, ATR_PERIOD)
+    df["obv"] = calculate_obv(close, volume)
+    df["macd"], df["macd_signal"], df["macd_histogram"] = calculate_macd(close, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    df["bb_upper"], df["bb_middle"], df["bb_lower"] = calculate_bollinger_bands(close, BB_PERIOD, BB_STD)
+    df["adx"], df["plus_di"], df["minus_di"] = calculate_adx(high, low, close, ADX_PERIOD)
+    df["stoch_k"], df["stoch_d"] = calculate_stoch_rsi(close, RSI_PERIOD, 14, 3, 3)
+    df["vwap"] = calculate_vwap(high, low, close, volume, VWAP_PERIOD)
+    df["volume_avg"] = volume.rolling(20).mean()
+    df["volume_ratio"] = volume / df["volume_avg"].clip(lower=0.001)
+    df["hammer"] = detect_hammer(open_price, high, low, close)
+    df["engulfing"] = detect_engulfing(open_price, close)
+    
     df.dropna(inplace=True)
     return df
 
-def _v(row, col, default=0.0):
+def safe_get(row, col, default=0.0):
     try:
-        x = float(row[col]) if col in row.index else default
-        return x if pd.notna(x) else default
-    except: return default
+        val = float(row[col]) if col in row.index else default
+        return val if pd.notna(val) else default
+    except:
+        return default
 
-def compute_mtf_bias(df4h):
-    if df4h is None or len(df4h)<3: return {"bias":"UNKNOWN","score":0}
-    df4h = compute_indicators(df4h)
-    if len(df4h)<3: return {"bias":"UNKNOWN","score":0}
-    last=df4h.iloc[-2]; score=0; price=float(last["close"])
-    if _v(last,"ema_fast")>_v(last,"ema_slow"): score+=2
-    else: score-=2
-    r4=_v(last,"rsi")
-    if r4>55: score+=1
-    elif r4<45: score-=1
-    if _v(last,"macd")>_v(last,"macd_sig"): score+=1
-    else: score-=1
-    if price>_v(last,"sma200"): score+=1
-    else: score-=1
-    bias = "BULLISH" if score>=3 else "BEARISH" if score<=-3 else "NEUTRAL"
-    return {"bias":bias,"score":score}
-
-def generate_signals(df, mtf=None, fg=None):
-    if len(df)<4: return {}
-    last=df.iloc[-2]; prev=df.iloc[-3]
-    price=float(last["close"]); cfg=MODES[state.mode]
-    sc={}; patterns=[]
-
-    rsi=_v(last,"rsi")
-    if rsi<=state.rsi_buy:    rsi_sig,sc["rsi"]="OVERSOLD ↑",+2
-    elif rsi>=state.rsi_sell: rsi_sig,sc["rsi"]="OVERBOUGHT ↓",-2
-    elif rsi>=50:              rsi_sig,sc["rsi"]="BULLISH",+1
-    else:                      rsi_sig,sc["rsi"]="BEARISH",-1
-
-    k_n,d_n=_v(last,"stoch_k"),_v(last,"stoch_d")
-    k_p,d_p=_v(prev,"stoch_k"),_v(prev,"stoch_d")
-    cup=k_p<d_p and k_n>d_n; cdn=k_p>d_p and k_n<d_n
-    if k_n<=20 and cup:    stoch_sig,sc["stoch"]="OVERSOLD CROSS ↑",+2
-    elif k_n>=80 and cdn:  stoch_sig,sc["stoch"]="OVERBOUGHT CROSS ↓",-2
-    elif k_n<=20:           stoch_sig,sc["stoch"]="OVERSOLD",+1
-    elif k_n>=80:           stoch_sig,sc["stoch"]="OVERBOUGHT",-1
-    elif k_n>d_n:           stoch_sig,sc["stoch"]="BULLISH",+1
-    else:                   stoch_sig,sc["stoch"]="BEARISH",-1
-
-    pd_=_v(prev,"ema_fast")-_v(prev,"ema_slow")
-    ld_=_v(last,"ema_fast")-_v(last,"ema_slow")
-    if pd_<0 and ld_>0:    ema_sig,sc["ema"]="GOLDEN CROSS ✨",+2
-    elif pd_>0 and ld_<0:   ema_sig,sc["ema"]="DEATH CROSS 💀",-2
-    elif ld_>0:              ema_sig,sc["ema"]="BULLISH",+1
-    else:                    ema_sig,sc["ema"]="BEARISH",-1
-
-    m_n,s_n,h_n=_v(last,"macd"),_v(last,"macd_sig"),_v(last,"macd_hist")
-    m_p,s_p=_v(prev,"macd"),_v(prev,"macd_sig")
-    if m_p<s_p and m_n>s_n:  macd_sig,sc["macd"]="BULLISH CROSS ↑",+2
-    elif m_p>s_p and m_n<s_n: macd_sig,sc["macd"]="BEARISH CROSS ↓",-2
-    elif m_n>s_n:              macd_sig,sc["macd"]="BULLISH",+1
-    else:                      macd_sig,sc["macd"]="BEARISH",-1
-
-    bb_u=_v(last,"bb_upper"); bb_l=_v(last,"bb_lower")
-    bb_pct=(price-bb_l)/(bb_u-bb_l)*100 if bb_u!=bb_l else 50
-    if price<=bb_l:       bb_sig,sc["bb"]="BELOW LOWER ↑",+2
-    elif price>=bb_u:      bb_sig,sc["bb"]="ABOVE UPPER ↓",-2
-    elif bb_pct<40:        bb_sig,sc["bb"]="LOWER HALF",+1
-    elif bb_pct>60:        bb_sig,sc["bb"]="UPPER HALF",-1
-    else:                  bb_sig,sc["bb"]="MID BAND",0
-
-    adx_v=_v(last,"adx"); dmp=_v(last,"dmp"); dmn=_v(last,"dmn")
-    trending=adx_v>=ADX_TRENDING
-    adx_sig=(f"RANGING ({adx_v:.0f})" if not trending else
-             f"TREND UP ({adx_v:.0f})" if dmp>dmn else f"TREND DOWN ({adx_v:.0f})")
-
-    obv_n=_v(last,"obv"); obv_p=_v(prev,"obv")
-    obv_ema=float(df["obv"].ewm(span=10).mean().iloc[-2])
-    if obv_n>obv_ema and obv_n>obv_p:   obv_sig,sc["obv"]="RISING ↑",+1
-    elif obv_n<obv_ema and obv_n<obv_p:  obv_sig,sc["obv"]="FALLING ↓",-1
-    else:                                 obv_sig,sc["obv"]="NEUTRAL",0
-
-    vwap=_v(last,"vwap")
-    if vwap>0:
-        if price>vwap*1.003:    vwap_sig,sc["vwap"]="ABOVE VWAP ↑",+1
-        elif price<vwap*0.997:  vwap_sig,sc["vwap"]="BELOW VWAP ↓",-1
-        else:                    vwap_sig,sc["vwap"]="AT VWAP",0
-    else: vwap_sig="N/A"; sc["vwap"]=0
-
-    sma200=_v(last,"sma200")
-    if price>sma200: regime_sig,sc["regime"]="BULL MARKET ↑",+1
-    else:             regime_sig,sc["regime"]="BEAR MARKET ↓",-1
-
-    vol_r=_v(last,"vol_ratio",1.0)
-    raw_dir=sum(sc.values())
-    if vol_r>=VOLUME_SPIKE_MULT:   vol_sig,sc["vol"]=f"SPIKE {vol_r:.1f}x ✅",+1 if raw_dir>=0 else -1
-    elif vol_r<0.6:                 vol_sig,sc["vol"]=f"LOW {vol_r:.1f}x ⚠️",-1
-    else:                           vol_sig,sc["vol"]=f"NORMAL {vol_r:.1f}x",0
-
-    cdl=0
-    if _v(last,"cdl_hammer")>0:    patterns.append("Hammer 🔨"); cdl+=1
-    eng=_v(last,"cdl_engulfing")
-    if eng>0:   patterns.append("Bullish Engulfing 🟢"); cdl+=2
-    elif eng<0: patterns.append("Bearish Engulfing 🔴"); cdl-=2
-    if cdl!=0: sc["candle"]=max(-2,min(2,cdl))
-
-    atr=_v(last,"atr")
-
-    mtf_note=""; mtf_conflict=False
-    if mtf and mtf.get("bias") not in ("UNKNOWN",None):
-        bias=mtf["bias"]; raw_now=sum(sc.values())
-        if bias=="BEARISH" and raw_now>0:
-            for k in sc: sc[k]=sc[k]//2
-            mtf_note="⚠️ 4H BEARISH — score halved"; mtf_conflict=True
-        elif bias=="BULLISH" and raw_now<0:
-            for k in sc: sc[k]=sc[k]//2
-            mtf_note="⚠️ 4H BULLISH — score halved"; mtf_conflict=True
-        else: mtf_note=f"✅ 4H confirms: {bias}"
-
-    fg_note=""; fg_warn_long=False
-    if fg is not None and USE_FEAR_GREED:
-        if fg>FG_MAX_FOR_LONG:   fg_note=f"⚠️ Extreme Greed ({fg}) — সতর্ক থাকো"; fg_warn_long=True
-        elif fg<FG_MIN_FOR_LONG: fg_note=f"📊 Extreme Fear ({fg}) — possible bottom"
-        else:                     fg_note=f"📊 F&G: {fg} {'(Greed)' if fg>=50 else '(Fear)'}"
-
-    raw_score=sum(sc.values())
-    adx_filt=not trending
-    comp=max(-12,min(12,raw_score//2 if adx_filt else raw_score))
-
-    if comp>=8:    composite="STRONG BUY"
-    elif comp>=4:  composite="BUY"
-    elif comp<=-8: composite="STRONG SELL"
-    elif comp<=-4: composite="SELL"
-    else:          composite="NEUTRAL"
-
-    is_long=composite in ("BUY","STRONG BUY")
-    is_short=composite in ("SELL","STRONG SELL")
-
-    sl_m=cfg["atr_sl"]; tp1_m=cfg["atr_tp1"]; tp2_m=cfg["atr_tp2"]
-    if is_long:
-        sl=price-atr*sl_m; tp1=price+atr*tp1_m; tp2=price+atr*tp2_m
+def compute_mtf_bias(df_4h):
+    if df_4h is None or len(df_4h) < 3:
+        return {"bias": "UNKNOWN", "score": 0}
+    
+    df_4h = compute_indicators(df_4h)
+    if len(df_4h) < 3:
+        return {"bias": "UNKNOWN", "score": 0}
+    
+    last = df_4h.iloc[-2]
+    score = 0
+    
+    if safe_get(last, "ema_fast") > safe_get(last, "ema_slow"):
+        score += 2
     else:
-        sl=price+atr*sl_m; tp1=price-atr*tp1_m; tp2=price-atr*tp2_m
+        score -= 2
+    
+    rsi_value = safe_get(last, "rsi")
+    if rsi_value > 55:
+        score += 1
+    elif rsi_value < 45:
+        score -= 1
+    
+    if safe_get(last, "macd") > safe_get(last, "macd_signal"):
+        score += 1
+    else:
+        score -= 1
+    
+    if safe_get(last, "close") > safe_get(last, "sma200"):
+        score += 1
+    else:
+        score -= 1
+    
+    if score >= 3:
+        bias = "BULLISH"
+    elif score <= -3:
+        bias = "BEARISH"
+    else:
+        bias = "NEUTRAL"
+    
+    return {"bias": bias, "score": score}
 
-    rr2=abs(tp2-price)/abs(price-sl) if abs(price-sl)>0 else 0
-
-    exit_sig=None; exit_rsn=None
-    if rsi>=state.rsi_sell-5 and sc.get("macd",0)==-2 and bb_pct>75:
-        exit_sig="EXIT LONG 🔔"; exit_rsn="RSI overbought + MACD bearish + Near upper BB"
-    elif rsi<=state.rsi_buy+5 and sc.get("macd",0)==+2 and bb_pct<25:
-        exit_sig="EXIT SHORT 🔔"; exit_rsn="RSI oversold + MACD bullish + Near lower BB"
-
-    return dict(
-        price=price,tf=state.active_tf,
-        ts=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
-        rsi_val=rsi,rsi_sig=rsi_sig,
-        k_val=k_n,d_val=d_n,stoch_sig=stoch_sig,
-        ema_fast=_v(last,"ema_fast"),ema_slow=_v(last,"ema_slow"),ema_sig=ema_sig,
-        macd_val=m_n,hist_val=h_n,macd_sig=macd_sig,
-        bb_upper=bb_u,bb_lower=bb_l,bb_pct=bb_pct,bb_sig=bb_sig,
-        adx_val=adx_v,adx_sig=adx_sig,trending=trending,
-        obv_sig=obv_sig,vwap_sig=vwap_sig,vol_sig=vol_sig,
-        regime_sig=regime_sig,atr_val=atr,sma200=sma200,
-        patterns=patterns,
-        mtf=mtf,mtf_note=mtf_note,mtf_conflict=mtf_conflict,
-        fg=fg,fg_note=fg_note,fg_warn_long=fg_warn_long,
-        scores=sc,raw_score=raw_score,
-        adx_filtered=adx_filt,score=comp,composite=composite,
-        is_long=is_long,is_short=is_short,
-        stop_loss=sl,take_profit1=tp1,take_profit2=tp2,rr2=rr2,
-        mode=state.mode,exit_signal=exit_sig,exit_reason=exit_rsn,
-    )
+def generate_signals(df, mtf=None, fear_greed=None):
+    if len(df) < 4:
+        return {}
+    
+    last = df.iloc[-2]
+    prev = df.iloc[-3]
+    price = float(last["close"])
+    config = MODES[state.mode]
+    
+    score_components = {}
+    patterns = []
+    
+    # RSI
+    rsi_value = safe_get(last, "rsi")
+    if rsi_value <= state.rsi_buy:
+        rsi_signal = "OVERSOLD ↑"
+        score_components["rsi"] = 2
+    elif rsi_value >= state.rsi_sell:
+        rsi_signal = "OVERBOUGHT ↓"
+        score_components["rsi"] = -2
+    elif rsi_value >= 50:
+        rsi_signal = "BULLISH"
+        score_components["rsi"] = 1
+    else:
+        rsi_signal = "BEARISH"
+        score_components["rsi"] = -1
+    
+    # Stochastic RSI
+    k_now = safe_get(last, "stoch_k")
+    d_now = safe_get(last, "stoch_d")
+    k_prev = safe_get(prev, "stoch_k")
+    d_prev = safe_get(prev, "stoch_d")
+    
+    cross_up = k_prev < d_prev and k_now > d_now
+    cross_down = k_prev > d_prev and k_now < d_now
+    
+    if k_now <= 20 and cross_up:
+        stoch_signal = "OVERSOLD CROSS ↑"
+        score_components["stoch"] = 2
+    elif k_now >= 80 and cross_down:
+        stoch_signal = "OVERBOUGHT CROSS ↓"
+        score_components["stoch"] = -2
+    elif k_now <= 20:
+        stoch_signal = "OVERSOLD"
+        score_components["stoch"] = 1
+    elif k_now >= 80:
+        stoch_signal = "OVERBOUGHT"
+        score_components["stoch"] = -1
+    elif k_now > d_now:
+        stoch_signal = "BULLISH"
+        score_components["stoch"] = 1
+    else:
+        stoch_signal = "BEARISH"
+        score_components["stoch"] = -1
+    
+    # EMA
+    prev_diff = safe_get(prev, "ema_fast") - safe_get(prev, "ema_slow")
+    last_diff = safe_get(last, "ema_fast") - safe_get(last, "ema_slow")
+    
+    if prev_diff < 0 and last_diff > 0:
+        ema_signal = "GOLDEN CROSS ✨"
+        score_components["ema"] = 2
+    elif prev_diff > 0 and last_diff < 0:
+        ema_signal = "DEATH CROSS 💀"
+        score_components["ema"] = -2
+    elif last_diff > 0:
+        ema_signal = "BULLISH"
+        score_components["ema"] = 1
+    else:
+        ema_signal = "BEARISH"
+        score_components["ema"] = -1
+    
+    # MACD
+    macd_now = safe_get(last, "macd")
+    signal_now = safe_get(last, "macd_signal")
+    macd_prev = safe_get(prev, "macd")
+    signal_prev = safe_get(prev, "macd_signal")
+    
+    if macd_prev < signal_prev and macd_now > signal_now:
+        macd_signal_text = "BULLISH CROSS ↑"
+        score_components["macd"] = 2
+    elif macd_prev > signal_prev and macd_now < signal_now:
+        macd_signal_text = "BEARISH CROSS ↓"
+        score_components["macd"] = -2
+    elif macd_now > signal_now:
+        macd_signal_text = "BULLISH"
+        score_components["macd"] = 1
+    else:
+        macd_signal_text = "BEARISH"
+        score_components["macd"] = -1
+    
+    # Bollinger Bands
+    bb_upper = safe_get(last, "bb_upper")
+    bb_lower = safe_get(last, "bb_lower")
+    bb_percent = (price - bb_lower) / (bb_upper - bb_lower) * 100 if bb_upper != bb_lower else 50
+    
+    if price <= bb_lower:
+        bb_signal = "BELOW LOWER ↑"
+        score_components["bb"] = 2
+    elif price >= bb_upper:
+        bb_signal = "ABOVE UPPER ↓"
+        score_components["bb"] = -2
+    elif bb_percent < 40:
+        bb_signal = "LOWER HALF"
+        score_components["bb"] = 1
+    elif bb_percent > 60:
+        bb_signal = "UPPER HALF"
+        score_components["bb"] = -1
+    else:
+        bb_signal = "MID BAND"
+        score_components["bb"] = 0
+    
+    # ADX
+    adx_value = safe_get(last, "adx")
+    plus_di = safe_get(last, "plus_di")
+    minus_di = safe_get(last, "minus_di")
+    is_trending = adx_value >= ADX_TRENDING
+    
+    if not is_trending:
+        adx_signal = f"RANGING ({adx_value:.0f})"
+    elif plus_di > minus_di:
+        adx_signal = f"TREND UP ({adx_value:.0f})"
+    else:
+        adx_signal = f"TREND DOWN ({adx_value:.0f})"
+    
+    # OBV
+    obv_now = safe_get(last, "obv")
+    obv_prev = safe_get(prev, "obv")
+    obv_ema = float(df["obv"].ewm(span=10).mean().iloc[-2])
+    
+    if obv_now > obv_ema and obv_now > obv_prev:
+        obv_signal = "RISING ↑"
+        score_components["obv"] = 1
+    elif obv_now < obv_ema and obv_now < obv_prev:
+        obv_signal = "FALLING ↓"
+        score_components["obv"] = -1
+    else:
+        obv_signal = "NEUTRAL"
+        score_components["obv"] = 0
+    
+    # VWAP
+    vwap_value = safe_get(last, "vwap")
+    if vwap_value > 0:
+        if price > vwap_value * 1.003:
+            vwap_signal = "ABOVE VWAP ↑"
+            score_components["vwap"] = 1
+        elif price < vwap_value * 0.997:
+            vwap_signal = "BELOW VWAP ↓"
+            score_components["vwap"] = -1
+        else:
+            vwap_signal = "AT VWAP"
+            score_components["vwap"] = 0
+    else:
+        vwap_signal = "N/A"
+        score_components["vwap"] = 0
+    
+    # Market regime (SMA200)
+    sma200 = safe_get(last, "sma200")
+    if price > sma200:
+        regime_signal = "BULL MARKET ↑"
+        score_components["regime"] = 1
+    else:
+        regime_signal = "BEAR MARKET ↓"
+        score_components["regime"] = -1
+    
+    # Volume
+    volume_ratio = safe_get(last, "volume_ratio", 1.0)
+    raw_direction = sum(score_components.values())
+    
+    if volume_ratio >= VOLUME_SPIKE_MULT:
+        volume_signal = f"SPIKE {volume_ratio:.1f}x ✅"
+        score_components["volume"] = 1 if raw_direction >= 0 else -1
+    elif volume_ratio < 0.6:
+        volume_signal = f"LOW {volume_ratio:.1f}x ⚠️"
+        score_components["volume"] = -1
+    else:
+        volume_signal = f"NORMAL {volume_ratio:.1f}x"
+        score_components["volume"] = 0
+    
+    # Candlestick patterns
+    candle_score = 0
+    if safe_get(last, "hammer") > 0:
+        patterns.append("Hammer 🔨")
+        candle_score += 1
+    
+    engulfing = safe_get(last, "engulfing")
+    if engulfing > 0:
+        patterns.append("Bullish Engulfing 🟢")
+        candle_score += 2
+    elif engulfing < 0:
+        patterns.append("Bearish Engulfing 🔴")
+        candle_score -= 2
+    
+    if candle_score != 0:
+        score_components["candle"] = max(-2, min(2, candle_score))
+    
+    # ATR for stop loss/take profit
+    atr_value = safe_get(last, "atr")
+    
+    # MTF analysis
+    mtf_note = ""
+    mtf_conflict = False
+    if mtf and mtf.get("bias") not in ("UNKNOWN", None):
+        bias = mtf["bias"]
+        current_score = sum(score_components.values())
+        
+        if bias == "BEARISH" and current_score > 0:
+            for key in score_components:
+                score_components[key] = score_components[key] // 2
+            mtf_note = "⚠️ 4H BEARISH — score halved"
+            mtf_conflict = True
+        elif bias == "BULLISH" and current_score < 0:
+            for key in score_components:
+                score_components[key] = score_components[key] // 2
+            mtf_note = "⚠️ 4H BULLISH — score halved"
+            mtf_conflict = True
+        else:
+            mtf_note = f"✅ 4H confirms: {bias}"
+    
+    # Fear & Greed
+    fg_note = ""
+    fg_warn_long = False
+    if fear_greed is not None and USE_FEAR_GREED:
+        if fear_greed > FG_MAX_FOR_LONG:
+            fg_note = f"⚠️ Extreme Greed ({fear_greed}) — be careful"
+            fg_warn_long = True
+        elif fear_greed < FG_MIN_FOR_LONG:
+            fg_note = f"📊 Extreme Fear ({fear_greed}) — possible bottom"
+        else:
+            fg_note = f"📊 F&G: {fear_greed} {'(Greed)' if fear_greed >= 50 else '(Fear)'}"
+    
+    raw_score = sum(score_components.values())
+    adjusted_score = max(-12, min(12, raw_score // 2 if not is_trending else raw_score))
+    
+    if adjusted_score >= 8:
+        composite = "STRONG BUY"
+    elif adjusted_score >= 4:
+        composite = "BUY"
+    elif adjusted_score <= -8:
+        composite = "STRONG SELL"
+    elif adjusted_score <= -4:
+        composite = "SELL"
+    else:
+        composite = "NEUTRAL"
+    
+    is_long = composite in ("BUY", "STRONG BUY")
+    is_short = composite in ("SELL", "STRONG SELL")
+    
+    sl_multiplier = config["atr_sl"]
+    tp1_multiplier = config["atr_tp1"]
+    tp2_multiplier = config["atr_tp2"]
+    
+    if is_long:
+        stop_loss = price - atr_value * sl_multiplier
+        take_profit1 = price + atr_value * tp1_multiplier
+        take_profit2 = price + atr_value * tp2_multiplier
+    else:
+        stop_loss = price + atr_value * sl_multiplier
+        take_profit1 = price - atr_value * tp1_multiplier
+        take_profit2 = price - atr_value * tp2_multiplier
+    
+    risk_reward_ratio = abs(take_profit2 - price) / abs(price - stop_loss) if abs(price - stop_loss) > 0 else 0
+    
+    # Exit signals
+    exit_signal = None
+    exit_reason = None
+    
+    if rsi_value >= state.rsi_sell - 5 and score_components.get("macd", 0) == -2 and bb_percent > 75:
+        exit_signal = "EXIT LONG 🔔"
+        exit_reason = "RSI overbought + MACD bearish + Near upper BB"
+    elif rsi_value <= state.rsi_buy + 5 and score_components.get("macd", 0) == 2 and bb_percent < 25:
+        exit_signal = "EXIT SHORT 🔔"
+        exit_reason = "RSI oversold + MACD bullish + Near lower BB"
+    
+    return {
+        "price": price,
+        "timeframe": state.active_tf,
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        "rsi_value": rsi_value,
+        "rsi_signal": rsi_signal,
+        "stoch_k": k_now,
+        "stoch_d": d_now,
+        "stoch_signal": stoch_signal,
+        "ema_fast": safe_get(last, "ema_fast"),
+        "ema_slow": safe_get(last, "ema_slow"),
+        "ema_signal": ema_signal,
+        "macd_value": macd_now,
+        "macd_histogram": safe_get(last, "macd_histogram"),
+        "macd_signal": macd_signal_text,
+        "bb_upper": bb_upper,
+        "bb_lower": bb_lower,
+        "bb_percent": bb_percent,
+        "bb_signal": bb_signal,
+        "adx_value": adx_value,
+        "adx_signal": adx_signal,
+        "is_trending": is_trending,
+        "obv_signal": obv_signal,
+        "vwap_signal": vwap_signal,
+        "volume_signal": volume_signal,
+        "regime_signal": regime_signal,
+        "atr_value": atr_value,
+        "sma200": sma200,
+        "patterns": patterns,
+        "mtf": mtf,
+        "mtf_note": mtf_note,
+        "mtf_conflict": mtf_conflict,
+        "fear_greed": fear_greed,
+        "fg_note": fg_note,
+        "fg_warn_long": fg_warn_long,
+        "score_components": score_components,
+        "raw_score": raw_score,
+        "adjusted_score": adjusted_score,
+        "composite": composite,
+        "is_long": is_long,
+        "is_short": is_short,
+        "stop_loss": stop_loss,
+        "take_profit1": take_profit1,
+        "take_profit2": take_profit2,
+        "risk_reward_ratio": risk_reward_ratio,
+        "mode": state.mode,
+        "exit_signal": exit_signal,
+        "exit_reason": exit_reason,
+    }
 
 async def run_analysis(symbol):
-    df=await fetch_ohlcv(symbol,state.active_tf)
-    if df is None: return None
-    df=compute_indicators(df)
-    if len(df)<3: return None
-    df4h=await fetch_ohlcv(symbol,CONFIRM_TF)
-    mtf=compute_mtf_bias(df4h)
-    fg=await fetch_fear_greed() if USE_FEAR_GREED else None
-    return generate_signals(df,mtf,fg)
+    df = await fetch_ohlcv(symbol, state.active_tf)
+    if df is None:
+        return None
+    
+    df = compute_indicators(df)
+    if len(df) < 3:
+        return None
+    
+    df_4h = await fetch_ohlcv(symbol, CONFIRM_TF)
+    mtf_bias = compute_mtf_bias(df_4h)
+    
+    fear_greed_value = await fetch_fear_greed() if USE_FEAR_GREED else None
+    
+    return generate_signals(df, mtf_bias, fear_greed_value)
 
 # ══════════════════════════════════════════════════════════════════════
 #  🎨  FORMATTING
 # ══════════════════════════════════════════════════════════════════════
 
-SIG_ICON  = {"STRONG BUY":"🟢🟢","BUY":"🟢","NEUTRAL":"⚪️","SELL":"🔴","STRONG SELL":"🔴🔴"}
-MODE_ICON = {"conservative":"🛡","balanced":"⚖️","sensitive":"⚡"}
+SIGNAL_ICONS = {
+    "STRONG BUY": "🟢🟢",
+    "BUY": "🟢",
+    "NEUTRAL": "⚪️",
+    "SELL": "🔴",
+    "STRONG SELL": "🔴🔴"
+}
 
-def cico(c): return SIG_ICON.get(c,"⚪️")
+MODE_ICONS = {
+    "conservative": "🛡",
+    "balanced": "⚖️",
+    "sensitive": "⚡"
+}
 
-def signal_grade(s: dict) -> str:
+def get_signal_icon(composite):
+    return SIGNAL_ICONS.get(composite, "⚪️")
+
+def calculate_signal_grade(signal_data):
     """
     Grade system: S / A / B / C / D
     Based on score, MTF confirmation, volume, and candlestick patterns.
     """
-    score   = abs(s["score"])
-    has_mtf = not s.get("mtf_conflict", False)
-    has_vol = s.get("scores",{}).get("vol",0) > 0
-    has_pat = len(s.get("patterns",[])) > 0
-    has_cdl = s.get("scores",{}).get("candle",0) != 0
+    score = abs(signal_data["adjusted_score"])
+    has_mtf = not signal_data.get("mtf_conflict", False)
+    has_volume = signal_data.get("score_components", {}).get("volume", 0) > 0
+    has_patterns = len(signal_data.get("patterns", [])) > 0
+    has_candle = signal_data.get("score_components", {}).get("candle", 0) != 0
+    
+    bonus = sum([has_mtf, has_volume, has_patterns or has_candle])
+    
+    if score >= 10 and bonus >= 2:
+        return "S"
+    if score >= 8 and bonus >= 2:
+        return "A"
+    if score >= 6 and bonus >= 1:
+        return "B"
+    if score >= 4:
+        return "C"
+    return "D"
 
-    bonus = sum([has_mtf, has_vol, has_pat or has_cdl])
-
-    if score >= 10 and bonus >= 2:  return "S"   # Rare perfect signal
-    if score >= 8  and bonus >= 2:  return "A"   # Very strong
-    if score >= 6  and bonus >= 1:  return "B"   # Good signal
-    if score >= 4:                  return "C"   # Moderate
-    return "D"                                    # Weak
-
-GRADE_LABEL = {
-    "S": "🏆 Grade S — পারফেক্ট signal",
-    "A": "⭐ Grade A — খুব strong",
-    "B": "✅ Grade B — ভালো signal",
-    "C": "⚠️ Grade C — moderate, সতর্ক থাকো",
-    "D": "❌ Grade D — weak, এড়িয়ে চলো",
+GRADE_LABELS = {
+    "S": "🏆 Grade S — Perfect signal",
+    "A": "⭐ Grade A — Very strong",
+    "B": "✅ Grade B — Good signal",
+    "C": "⚠️ Grade C — Moderate, be careful",
+    "D": "❌ Grade D — Weak, avoid",
 }
 
-def score_bar(score: int, maxv: int = 12) -> str:
+def create_score_bar(score, max_value=12):
     """Visual score bar with direction."""
-    filled = min(abs(score), maxv)
-    empty  = maxv - filled
-    bar    = "█" * filled + "░" * empty
-    arrow  = "▲" if score > 0 else "▼" if score < 0 else "─"
+    filled = min(abs(score), max_value)
+    empty = max_value - filled
+    bar = "█" * filled + "░" * empty
+    arrow = "▲" if score > 0 else "▼" if score < 0 else "─"
     return f"[{bar}] {arrow}"
 
-def ind_dot(val: int) -> str:
+def get_indicator_dot(value):
     """Single indicator dot: green/red/gray."""
-    if val > 0:  return "🟢"
-    if val < 0:  return "🔴"
+    if value > 0:
+        return "🟢"
+    if value < 0:
+        return "🔴"
     return "⚪️"
 
-def fmt_signal(symbol: str, s: dict) -> str:
+def format_signal_message(symbol: str, signal_data: dict) -> str:
     """
     Redesigned signal message.
     Structure:
@@ -522,513 +778,745 @@ def fmt_signal(symbol: str, s: dict) -> str:
       6. How to trade — step by step
       7. Footer
     """
-    coin  = s2coin(symbol)
-    icon  = cico(s["composite"])
-    grade = signal_grade(s)
-    sc    = s["scores"]
-    m_ico = MODE_ICON.get(s["mode"],"")
-
-    sl_pct = abs(s["price"]-s["stop_loss"])    /s["price"]*100
-    t1_pct = abs(s["price"]-s["take_profit1"]) /s["price"]*100
-    t2_pct = abs(s["price"]-s["take_profit2"]) /s["price"]*100
-
-    # ── Direction block ───────────────────────────────────────────────
-    if s["is_long"]:
-        dir_header = "📈 *LONG  —  BUY করো*"
-        action_tip = "_Spot Buy → SL set করো → TP1/TP2 তে sell করো_"
-        how = (
-            f"*── কীভাবে trade করবে ──────────*\n"
-            f"1️⃣  Gate.io / Binance খোলো\n"
+    coin = symbol_to_coin(symbol)
+    icon = get_signal_icon(signal_data["composite"])
+    grade = calculate_signal_grade(signal_data)
+    components = signal_data["score_components"]
+    mode_icon = MODE_ICONS.get(signal_data["mode"], "")
+    
+    sl_percent = abs(signal_data["price"] - signal_data["stop_loss"]) / signal_data["price"] * 100
+    tp1_percent = abs(signal_data["price"] - signal_data["take_profit1"]) / signal_data["price"] * 100
+    tp2_percent = abs(signal_data["price"] - signal_data["take_profit2"]) / signal_data["price"] * 100
+    
+    # Direction block
+    if signal_data["is_long"]:
+        direction_header = "📈 *LONG  —  BUY now*"
+        action_tip = "_Spot Buy → Set SL → Sell at TP1/TP2_"
+        trade_steps = (
+            f"*── How to trade ──────────*\n"
+            f"1️⃣  Open Gate.io / Binance\n"
             f"2️⃣  *{coin}/USDT* Spot → BUY\n"
-            f"3️⃣  Stop Loss: `${s['stop_loss']:,.4f}` তে order দাও\n"
-            f"4️⃣  TP1 hit হলে ৫০% বেচো: `${s['take_profit1']:,.4f}`\n"
-            f"5️⃣  বাকি ৫০% TP2 পর্যন্ত রাখো: `${s['take_profit2']:,.4f}`\n"
+            f"3️⃣  Place Stop Loss at: `${signal_data['stop_loss']:,.4f}`\n"
+            f"4️⃣  Sell 50% at TP1: `${signal_data['take_profit1']:,.4f}`\n"
+            f"5️⃣  Keep 50% until TP2: `${signal_data['take_profit2']:,.4f}`\n"
         )
-    elif s["is_short"]:
-        dir_header = "📉 *SHORT  —  SELL করো*"
-        action_tip = "_Hold থাকলে Sell করো → re-entry lower এ_"
-        how = (
-            f"*── কীভাবে trade করবে ──────────*\n"
-            f"1️⃣  Gate.io / Binance খোলো\n"
-            f"2️⃣  {coin} hold থাকলে SELL করো\n"
-            f"3️⃣  SL নজরে রাখো: `${s['stop_loss']:,.4f}`\n"
-            f"4️⃣  TP1: `${s['take_profit1']:,.4f}`\n"
-            f"5️⃣  TP2: `${s['take_profit2']:,.4f}`\n"
+    elif signal_data["is_short"]:
+        direction_header = "📉 *SHORT  —  SELL now*"
+        action_tip = "_If holding, sell → re-enter lower_"
+        trade_steps = (
+            f"*── How to trade ──────────*\n"
+            f"1️⃣  Open Gate.io / Binance\n"
+            f"2️⃣  If holding {coin}, SELL\n"
+            f"3️⃣  Watch SL: `${signal_data['stop_loss']:,.4f}`\n"
+            f"4️⃣  TP1: `${signal_data['take_profit1']:,.4f}`\n"
+            f"5️⃣  TP2: `${signal_data['take_profit2']:,.4f}`\n"
         )
     else:
-        dir_header = "➡️ *NEUTRAL  —  অপেক্ষা করো*"
-        action_tip = "_Signal এখনো যথেষ্ট strong নয়_"
-        how = "_পরের auto-scan এ আবার দেখবো।_\n"
-
-    # ── Score bar ─────────────────────────────────────────────────────
-    bar = score_bar(s["score"])
-
-    # ── Indicator dots (quick visual) ─────────────────────────────────
-    dots = (
-        f"{ind_dot(sc.get('rsi',0))}RSI "
-        f"{ind_dot(sc.get('stoch',0))}SRSI "
-        f"{ind_dot(sc.get('ema',0))}EMA "
-        f"{ind_dot(sc.get('macd',0))}MACD "
-        f"{ind_dot(sc.get('bb',0))}BB "
-        f"{ind_dot(sc.get('obv',0))}OBV "
-        f"{ind_dot(sc.get('vwap',0))}VWAP "
-        f"{ind_dot(sc.get('vol',0))}VOL"
+        direction_header = "➡️ *NEUTRAL  —  Wait*"
+        action_tip = "_Signal not strong enough yet_"
+        trade_steps = "_We'll check again in next auto-scan._\n"
+    
+    # Score bar
+    score_bar = create_score_bar(signal_data["adjusted_score"])
+    
+    # Indicator dots (quick visual)
+    indicator_dots = (
+        f"{get_indicator_dot(components.get('rsi', 0))}RSI "
+        f"{get_indicator_dot(components.get('stoch', 0))}SRSI "
+        f"{get_indicator_dot(components.get('ema', 0))}EMA "
+        f"{get_indicator_dot(components.get('macd', 0))}MACD "
+        f"{get_indicator_dot(components.get('bb', 0))}BB "
+        f"{get_indicator_dot(components.get('obv', 0))}OBV "
+        f"{get_indicator_dot(components.get('vwap', 0))}VWAP "
+        f"{get_indicator_dot(components.get('volume', 0))}VOL"
     )
-
-    # ── Warnings ──────────────────────────────────────────────────────
+    
+    # Warnings
     warnings = []
-    if s.get("mtf_conflict"):
-        warnings.append("⚠️ *4H trend বিপরীত* — position size কমাও!")
-    if s.get("fg_warn_long") and s["is_long"]:
-        warnings.append("⚠️ *Extreme Greed* — overbought market, সতর্ক থাকো")
-    if s["adx_filtered"]:
+    if signal_data.get("mtf_conflict"):
+        warnings.append("⚠️ *4H trend opposite* — reduce position size!")
+    if signal_data.get("fg_warn_long") and signal_data["is_long"]:
+        warnings.append("⚠️ *Extreme Greed* — overbought market, be careful")
+    if not signal_data["is_trending"]:
         warnings.append("⚠️ *Sideways market* (ADX weak) — score halved")
-    warn_block = ("\n" + "\n".join(warnings) + "\n") if warnings else ""
-
-    # ── Patterns ──────────────────────────────────────────────────────
-    pat_line = ""
-    if s["patterns"]:
-        pat_line = f"🕯 *Patterns:* {' · '.join(s['patterns'])}\n"
-
-    # ── Indicator detail (grouped) ────────────────────────────────────
+    
+    warning_block = ("\n" + "\n".join(warnings) + "\n") if warnings else ""
+    
+    # Patterns
+    pattern_line = ""
+    if signal_data["patterns"]:
+        pattern_line = f"🕯 *Patterns:* {' · '.join(signal_data['patterns'])}\n"
+    
+    # Indicator detail (grouped)
     trend_block = (
-        f"  {ind_dot(sc.get('ema',0))} EMA{EMA_FAST}/{EMA_SLOW}  →  {s['ema_sig']}\n"
-        f"  {ind_dot(sc.get('macd',0))} MACD       →  {s['macd_sig']}\n"
-        f"  {ind_dot(sc.get('regime',0))} Regime     →  {s['regime_sig']}\n"
-        f"  {ind_dot(sc.get('vwap',0))} VWAP       →  {s['vwap_sig']}\n"
-        f"  ◽ ADX        →  {s['adx_sig']}\n"
+        f"  {get_indicator_dot(components.get('ema', 0))} EMA{EMA_FAST}/{EMA_SLOW}  →  {signal_data['ema_signal']}\n"
+        f"  {get_indicator_dot(components.get('macd', 0))} MACD       →  {signal_data['macd_signal']}\n"
+        f"  {get_indicator_dot(components.get('regime', 0))} Regime     →  {signal_data['regime_signal']}\n"
+        f"  {get_indicator_dot(components.get('vwap', 0))} VWAP       →  {signal_data['vwap_signal']}\n"
+        f"  ◽ ADX        →  {signal_data['adx_signal']}\n"
     )
+    
     momentum_block = (
-        f"  {ind_dot(sc.get('rsi',0))} RSI `{s['rsi_val']:.1f}`  →  {s['rsi_sig']}\n"
-        f"  {ind_dot(sc.get('stoch',0))} StochRSI K:`{s['k_val']:.1f}` D:`{s['d_val']:.1f}`  →  {s['stoch_sig']}\n"
-        f"  {ind_dot(sc.get('bb',0))} BB `{s['bb_pct']:.0f}%`  →  {s['bb_sig']}\n"
+        f"  {get_indicator_dot(components.get('rsi', 0))} RSI `{signal_data['rsi_value']:.1f}`  →  {signal_data['rsi_signal']}\n"
+        f"  {get_indicator_dot(components.get('stoch', 0))} StochRSI K:`{signal_data['stoch_k']:.1f}` D:`{signal_data['stoch_d']:.1f}`  →  {signal_data['stoch_signal']}\n"
+        f"  {get_indicator_dot(components.get('bb', 0))} BB `{signal_data['bb_percent']:.0f}%`  →  {signal_data['bb_signal']}\n"
     )
+    
     volume_block = (
-        f"  {ind_dot(sc.get('obv',0))} OBV     →  {s['obv_sig']}\n"
-        f"  {ind_dot(sc.get('vol',0))} Volume  →  {s['vol_sig']}\n"
+        f"  {get_indicator_dot(components.get('obv', 0))} OBV     →  {signal_data['obv_signal']}\n"
+        f"  {get_indicator_dot(components.get('volume', 0))} Volume  →  {signal_data['volume_signal']}\n"
     )
-
+    
     return (
         f"{icon}{icon} *{coin}/USDT* {icon}{icon}\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"{dir_header}\n"
+        f"{direction_header}\n"
         f"{action_tip}\n\n"
-
-        f"*📊 Signal Grade:* `{grade}`  —  {GRADE_LABEL[grade]}\n"
-        f"`{bar}` `{s['score']:+d}/12`\n"
-        f"{dots}\n"
-        f"{pat_line}"
-        f"{warn_block}\n"
-
+        
+        f"*📊 Signal Grade:* `{grade}`  —  {GRADE_LABELS[grade]}\n"
+        f"`{score_bar}` `{signal_data['adjusted_score']:+d}/12`\n"
+        f"{indicator_dots}\n"
+        f"{pattern_line}"
+        f"{warning_block}\n"
+        
         f"*💰 Entry & Levels*\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"💵 Entry Price : `${s['price']:,.4f}`\n"
-        f"🛑 Stop Loss   : `${s['stop_loss']:,.4f}`  _(-{sl_pct:.1f}%)_\n"
-        f"🎯 TP1 (50%)   : `${s['take_profit1']:,.4f}`  _(+{t1_pct:.1f}%)_\n"
-        f"🎯 TP2 (50%)   : `${s['take_profit2']:,.4f}`  _(+{t2_pct:.1f}%)_\n"
-        f"📐 R:R Ratio   : `1 : {s['rr2']:.1f}`\n"
-        f"⏱  Timeframe  : `{s['tf']}` + `{CONFIRM_TF}` MTF\n"
+        f"💵 Entry Price : `${signal_data['price']:,.4f}`\n"
+        f"🛑 Stop Loss   : `${signal_data['stop_loss']:,.4f}`  _(-{sl_percent:.1f}%)_\n"
+        f"🎯 TP1 (50%)   : `${signal_data['take_profit1']:,.4f}`  _(+{tp1_percent:.1f}%)_\n"
+        f"🎯 TP2 (50%)   : `${signal_data['take_profit2']:,.4f}`  _(+{tp2_percent:.1f}%)_\n"
+        f"📐 R:R Ratio   : `1 : {signal_data['risk_reward_ratio']:.1f}`\n"
+        f"⏱  Timeframe  : `{signal_data['timeframe']}` + `{CONFIRM_TF}` MTF\n"
         f"🔒 Candle      : _Confirmed — no repaint_\n\n"
-
+        
         f"*📈 Trend Indicators*\n"
         f"{trend_block}\n"
         f"*⚡ Momentum Indicators*\n"
         f"{momentum_block}\n"
         f"*📦 Volume Indicators*\n"
         f"{volume_block}\n"
-
+        
         f"*🔍 Filters*\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"4H MTF  :  {s['mtf_note']}\n"
-        f"F&G     :  {s['fg_note']}\n\n"
-
+        f"4H MTF  :  {signal_data['mtf_note']}\n"
+        f"F&G     :  {signal_data['fg_note']}\n\n"
+        
         f"*🛒 Trade Steps*\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"{how}\n"
+        f"{trade_steps}\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"{m_ico} `{s['mode'].upper()}` mode  ·  🕒 _{s['ts']}_\n"
-        f"_⚠️ Not financial advice. নিজে research করো।_"
+        f"{mode_icon} `{signal_data['mode'].upper()}` mode  ·  🕒 _{signal_data['timestamp']}_\n"
+        f"_⚠️ Not financial advice. Do your own research._"
     )
 
 
-def fmt_exit(symbol: str, s: dict) -> str:
-    coin = s2coin(symbol)
-    is_long_exit = "LONG" in s.get("exit_signal","")
+def format_exit_message(symbol: str, signal_data: dict) -> str:
+    coin = symbol_to_coin(symbol)
+    is_long_exit = "LONG" in signal_data.get("exit_signal", "")
     icon = "🔴" if is_long_exit else "🟢"
-    action = "SELL করো (position close)" if is_long_exit else "BUY করো (short cover)"
+    action = "SELL now (close position)" if is_long_exit else "BUY now (cover short)"
+    
     return (
         f"🔔🔔 *EXIT SIGNAL — {coin}/USDT* 🔔🔔\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"{icon} *{s['exit_signal']}*\n\n"
-        f"💵 Current Price : `${s['price']:,.4f}`\n"
-        f"📋 Reason: _{s['exit_reason']}_\n\n"
-        f"RSI: `{s['rsi_val']:.1f}` · MACD: {s['macd_sig']}\n"
-        f"BB position: `{s['bb_pct']:.0f}%` of band\n\n"
-        f"*👉 এখন করো:* {action}\n"
+        f"{icon} *{signal_data['exit_signal']}*\n\n"
+        f"💵 Current Price : `${signal_data['price']:,.4f}`\n"
+        f"📋 Reason: _{signal_data['exit_reason']}_\n\n"
+        f"RSI: `{signal_data['rsi_value']:.1f}` · MACD: {signal_data['macd_signal']}\n"
+        f"BB position: `{signal_data['bb_percent']:.0f}%` of band\n\n"
+        f"*👉 Action now:* {action}\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"🕒 _{s['ts']}_"
+        f"🕒 _{signal_data['timestamp']}_"
     )
 
 
-def fmt_scan_row(symbol: str, s: dict) -> str:
-    coin  = s2coin(symbol)
-    grade = signal_grade(s)
-    f_    = "~" if s["adx_filtered"] else ""
-    mtf   = "✅" if not s.get("mtf_conflict") else "⚠️"
-    pat   = "🕯" if s["patterns"] else "  "
+def format_scan_row(symbol: str, signal_data: dict) -> str:
+    coin = symbol_to_coin(symbol)
+    grade = calculate_signal_grade(signal_data)
+    filter_indicator = "~" if not signal_data["is_trending"] else ""
+    mtf_indicator = "✅" if not signal_data.get("mtf_conflict") else "⚠️"
+    pattern_indicator = "🕯" if signal_data["patterns"] else "  "
+    
     return (
-        f"{cico(s['composite'])} *{coin}*"
-        f"  `${s['price']:,.4f}`"
-        f"  `{f_}{s['score']:+d}/12`"
+        f"{get_signal_icon(signal_data['composite'])} *{coin}*"
+        f"  `${signal_data['price']:,.4f}`"
+        f"  `{filter_indicator}{signal_data['adjusted_score']:+d}/12`"
         f"  `{grade}`"
-        f"  {pat}{mtf}"
+        f"  {pattern_indicator}{mtf_indicator}"
     )
 
 
-def fmt_price_alert(symbol: str, price: float, target: float, direction: str, sig: dict = None) -> str:
+def format_price_alert(symbol: str, current_price: float, target_price: float, direction: str, signal_data: dict = None) -> str:
     """Rich price alert with optional signal context."""
-    coin  = s2coin(symbol)
-    arrow = "🚀" if direction=="above" else "📉"
-    pct   = abs(price-target)/target*100
-
-    sig_note = ""
-    if sig and sig.get("composite") != "NEUTRAL":
-        grade = signal_grade(sig)
-        sig_note = (
+    coin = symbol_to_coin(symbol)
+    arrow = "🚀" if direction == "above" else "📉"
+    percent_change = abs(current_price - target_price) / target_price * 100
+    
+    signal_note = ""
+    if signal_data and signal_data.get("composite") != "NEUTRAL":
+        grade = calculate_signal_grade(signal_data)
+        signal_note = (
             f"\n\n*📊 Current Signal:*\n"
-            f"{cico(sig['composite'])} {sig['composite']}  `Grade {grade}`  `{sig['score']:+d}/12`\n"
-            f"SL: `${sig['stop_loss']:,.4f}` · TP2: `${sig['take_profit2']:,.4f}`\n"
-            f"_/analyze {coin} দিয়ে full signal দেখো_"
+            f"{get_signal_icon(signal_data['composite'])} {signal_data['composite']}  `Grade {grade}`  `{signal_data['adjusted_score']:+d}/12`\n"
+            f"SL: `${signal_data['stop_loss']:,.4f}` · TP2: `${signal_data['take_profit2']:,.4f}`\n"
+            f"_/analyze {coin} to see full signal_"
         )
-
+    
     return (
         f"{arrow}{arrow} *PRICE ALERT — {coin}/USDT* {arrow}{arrow}\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"Current : `${price:,.4f}`\n"
-        f"Target  : `${target:,.2f}` ({direction})\n"
-        f"Moved   : `{pct:.1f}%` from target\n"
-        f"{sig_note}\n"
+        f"Current : `${current_price:,.4f}`\n"
+        f"Target  : `${target_price:,.2f}` ({direction})\n"
+        f"Moved   : `{percent_change:.1f}%` from target\n"
+        f"{signal_note}\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
         f"🕒 _{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}_"
     )
 
 
-def fmt_scan_summary(lines: list, signals: list, tf: str, mode: str) -> str:
+def format_scan_summary(rows: list, signals: list, timeframe: str, mode: str) -> str:
     """Full scan summary with grouped BUY/SELL/NEUTRAL."""
-    buys    = [(s,sig) for s,sig in signals if sig["is_long"]]
-    sells   = [(s,sig) for s,sig in signals if sig["is_short"]]
-    m_ico   = MODE_ICON.get(mode,"")
-
+    buy_signals = [(s, sig) for s, sig in signals if sig["is_long"]]
+    sell_signals = [(s, sig) for s, sig in signals if sig["is_short"]]
+    mode_icon = MODE_ICONS.get(mode, "")
+    
     header = (
         f"📡 *MARKET SCAN*\n"
         f"┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄\n"
-        f"⏱ `{tf.upper()}` · {m_ico}`{mode.upper()}` · "
+        f"⏱ `{timeframe.upper()}` · {mode_icon}`{mode.upper()}` · "
         f"🕒 _{datetime.utcnow().strftime('%d %b %H:%M UTC')}_\n\n"
     )
-
-    body = "\n".join(lines) + "\n"
-
-    footer = f"\n🟢 *{len(buys)} BUY*  ·  🔴 *{len(sells)} SELL*"
+    
+    body = "\n".join(rows) + "\n"
+    
+    footer = f"\n🟢 *{len(buy_signals)} BUY*  ·  🔴 *{len(sell_signals)} SELL*"
     if not signals:
-        footer += "\n_কোনো actionable signal নেই — অপেক্ষা করো।_"
+        footer += "\n_No actionable signals — wait._"
     else:
-        footer += f"\n_নিচের full signal দেখে manually trade নাও।_"
-
+        footer += "\n_Check full signals below and trade manually._"
+    
     return header + body + footer
 
 # ══════════════════════════════════════════════════════════════════════
 #  🤖  COMMANDS
 # ══════════════════════════════════════════════════════════════════════
 
-HELP_TEXT=f"""
+HELP_TEXT = f"""
 📡 *Crypto Signal Bot — Manual Trading*
-_Signal দেখো → Gate / Binance এ manually trade নাও_
+_See signals → Trade manually on Gate / Binance_
 
 *📊 Analysis*
 `/analyze BTC` — full signal + grade + trade steps
-`/scan` — সব coin scan (grouped by BUY/SELL)
-`/tf 1h` — timeframe বদলাও _(1m 5m 15m 1h 4h 1d)_
+`/scan` — scan all coins (grouped by BUY/SELL)
+`/tf 1h` — change timeframe _(1m 5m 15m 1h 4h 1d)_
 
 *🎛 Signal Mode*
-`/mode sensitive` ⚡ — বেশি signal
+`/mode sensitive` ⚡ — more signals
 `/mode balanced` ⚖️ — recommended
-`/mode conservative` 🛡 — কম কিন্তু accurate
+`/mode conservative` 🛡 — fewer but accurate
 
 *📋 Watchlist*
 `/watch` · `/add SOL` · `/remove SOL`
 
 *🔔 Price Alert*
-`/alert BTC 70000 above` — price hit এ notify
+`/alert BTC 70000 above` — notify when price hits
 `/alert ETH 2500 below`
-`/alerts` — সব active alert
+`/alerts` — all active alerts
 `/cancelalert BTC`
 
 *⚙️ Settings*
-`/threshold 25 75` — RSI levels
+`/threshold 25 75` — adjust RSI levels
 
 *📐 Grade System*
 `S` 🏆 Perfect · `A` ⭐ Very strong
 `B` ✅ Good · `C` ⚠️ Moderate · `D` ❌ Weak
 
-💡 _শুধু_ `BTC` _লিখলেই signal আসবে!_
+💡 _Just type_ `BTC` _to get signal!_
 ⏰ _Auto scan: {' · '.join(SCAN_TIMES)} UTC_
 _Primary TF: {PRIMARY_TF} · Confirm TF: {CONFIRM_TF}_
 """
 
-async def cmd_start(u, c):
-    kb = [[
-        InlineKeyboardButton("📊 BTC Signal",  callback_data="quick_BTC"),
-        InlineKeyboardButton("📡 Scan All",    callback_data="scan"),
+async def start_command(update, context):
+    keyboard = [[
+        InlineKeyboardButton("📊 BTC Signal", callback_data="quick_BTC"),
+        InlineKeyboardButton("📡 Scan All", callback_data="scan"),
     ],[
-        InlineKeyboardButton("📋 Watchlist",   callback_data="watch"),
-        InlineKeyboardButton("🔔 Alerts",      callback_data="alerts"),
+        InlineKeyboardButton("📋 Watchlist", callback_data="watch"),
+        InlineKeyboardButton("🔔 Alerts", callback_data="alerts"),
     ],[
-        InlineKeyboardButton("⚙️ Settings",    callback_data="settings"),
-        InlineKeyboardButton("❓ Help",         callback_data="help"),
+        InlineKeyboardButton("⚙️ Settings", callback_data="settings"),
+        InlineKeyboardButton("❓ Help", callback_data="help"),
     ]]
-    await u.message.reply_text(
+    
+    await update.message.reply_text(
         f"📡 *Crypto Signal Bot*\n"
-        f"_Signal দেখো → manually trade নাও_\n\n"
-        f"Mode   : {MODE_ICON.get(state.mode,'')} `{state.mode.upper()}`\n"
+        f"_See signals → trade manually_\n\n"
+        f"Mode   : {MODE_ICONS.get(state.mode, '')} `{state.mode.upper()}`\n"
         f"TF     : `{state.active_tf}` + `{CONFIRM_TF}` MTF\n"
         f"Coins  : `{len(state.watchlist)}`\n"
         f"Grades : S 🏆 A ⭐ B ✅ C ⚠️ D ❌\n\n"
-        f"_BTC লিখলেই সাথে সাথে signal পাবে!_",
+        f"_Just type BTC to get signal!_",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(kb),
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
-async def cmd_help(u,c): await u.message.reply_text(HELP_TEXT,parse_mode=ParseMode.MARKDOWN)
+async def help_command(update, context):
+    await update.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
 
-async def cmd_analyze(update,ctx):
-    if not ctx.args: await update.message.reply_text("Usage: `/analyze BTC`",parse_mode=ParseMode.MARKDOWN); return
-    coin=ctx.args[0].upper().replace("USDT","").strip("/")
-    if not is_valid_coin(coin): await update.message.reply_text("❌ Invalid.",parse_mode=ParseMode.MARKDOWN); return
-    symbol=coin2s(coin)
-    wait=await update.message.reply_text(f"⏳ *{coin}* analyze করছি...",parse_mode=ParseMode.MARKDOWN)
-    sig=await run_analysis(symbol)
-    if not sig: await wait.edit_text(f"❌ `{coin}` data পাওয়া গেলো না।",parse_mode=ParseMode.MARKDOWN); return
-    kb=[[InlineKeyboardButton("🔄 Refresh",callback_data=f"quick_{coin}"),
-         InlineKeyboardButton("🔔 Alert",  callback_data=f"alertmenu_{coin}")]]
-    await wait.edit_text(fmt_signal(symbol,sig),parse_mode=ParseMode.MARKDOWN,reply_markup=InlineKeyboardMarkup(kb))
-    if sig.get("exit_signal"): await update.message.reply_text(fmt_exit(symbol,sig),parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_scan(update, ctx):
-    if not state.watchlist:
-        await update.message.reply_text("📋 Empty! `/add BTC`", parse_mode=ParseMode.MARKDOWN)
+async def analyze_command(update, context):
+    if not context.args:
+        await update.message.reply_text("Usage: `/analyze BTC`", parse_mode=ParseMode.MARKDOWN)
         return
-    wait = await update.message.reply_text(
-        f"🔄 *{len(state.watchlist)}টা coin* scan করছি...\n_এটু সময় লাগবে_",
+    
+    coin = context.args[0].upper().replace("USDT", "").strip("/")
+    if not is_valid_coin(coin):
+        await update.message.reply_text("❌ Invalid coin symbol.", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    symbol = coin_to_symbol(coin)
+    waiting_message = await update.message.reply_text(f"⏳ Analyzing *{coin}*...", parse_mode=ParseMode.MARKDOWN)
+    
+    signal = await run_analysis(symbol)
+    if not signal:
+        await waiting_message.edit_text(f"❌ Could not fetch data for `{coin}`.", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    keyboard = [[
+        InlineKeyboardButton("🔄 Refresh", callback_data=f"quick_{coin}"),
+        InlineKeyboardButton("🔔 Alert", callback_data=f"alertmenu_{coin}")
+    ]]
+    
+    await waiting_message.edit_text(
+        format_signal_message(symbol, signal),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    if signal.get("exit_signal"):
+        await update.message.reply_text(
+            format_exit_message(symbol, signal),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+async def scan_command(update, context):
+    if not state.watchlist:
+        await update.message.reply_text("📋 Watchlist empty! Use `/add BTC`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    waiting_message = await update.message.reply_text(
+        f"🔄 Scanning *{len(state.watchlist)} coins*...\n_This may take a moment_",
         parse_mode=ParseMode.MARKDOWN,
     )
-    min_s   = MODES[state.mode]["min_score"]
-    rows    = []
-    signals = []
-
+    
+    min_score = MODES[state.mode]["min_score"]
+    rows = []
+    actionable_signals = []
+    
     for symbol in state.watchlist:
-        sig = await run_analysis(symbol)
-        if not sig:
-            rows.append(f"⚠️ `{s2coin(symbol)}` — data error")
+        signal = await run_analysis(symbol)
+        if not signal:
+            rows.append(f"⚠️ `{symbol_to_coin(symbol)}` — data error")
             continue
-        rows.append(fmt_scan_row(symbol, sig))
-        if abs(sig["score"]) >= min_s and sig["composite"] != "NEUTRAL":
-            signals.append((symbol, sig))
-
+        
+        rows.append(format_scan_row(symbol, signal))
+        
+        if abs(signal["adjusted_score"]) >= min_score and signal["composite"] != "NEUTRAL":
+            actionable_signals.append((symbol, signal))
+    
     # Sort signals: STRONG first, then by score
-    signals.sort(key=lambda x: abs(x[1]["score"]), reverse=True)
-
-    summary = fmt_scan_summary(rows, signals, state.active_tf, state.mode)
-    await wait.edit_text(summary, parse_mode=ParseMode.MARKDOWN)
-
+    actionable_signals.sort(key=lambda x: abs(x[1]["adjusted_score"]), reverse=True)
+    
+    summary = format_scan_summary(rows, actionable_signals, state.active_tf, state.mode)
+    await waiting_message.edit_text(summary, parse_mode=ParseMode.MARKDOWN)
+    
     # Send full signal for each actionable coin
-    for symbol, sig in signals:
+    for symbol, signal in actionable_signals:
         await update.message.reply_text(
-            fmt_signal(symbol, sig), parse_mode=ParseMode.MARKDOWN,
+            format_signal_message(symbol, signal),
+            parse_mode=ParseMode.MARKDOWN,
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Refresh", callback_data=f"quick_{s2coin(symbol)}"),
-                InlineKeyboardButton("🔔 Alert",   callback_data=f"alertmenu_{s2coin(symbol)}"),
+                InlineKeyboardButton("🔄 Refresh", callback_data=f"quick_{symbol_to_coin(symbol)}"),
+                InlineKeyboardButton("🔔 Alert", callback_data=f"alertmenu_{symbol_to_coin(symbol)}"),
             ]])
         )
-        if sig.get("exit_signal"):
-            await update.message.reply_text(fmt_exit(symbol, sig), parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_mode(update,ctx):
-    if not ctx.args or ctx.args[0].lower() not in MODES:
-        lines=["*Signal Modes:*\n"]
-        for name,cfg in MODES.items():
-            lines.append(f"{MODE_ICON.get(name,'')} *{name.upper()}*{' ← active' if name==state.mode else ''}\n"
-                         f"  Score≥`{cfg['min_score']}/12` SL:`{cfg['atr_sl']}×ATR`")
-        await update.message.reply_text("\n".join(lines)+"\n\nChange: `/mode sensitive`",parse_mode=ParseMode.MARKDOWN); return
-    state.mode=ctx.args[0].lower(); state.save()
-    await update.message.reply_text(f"✅ Mode → {MODE_ICON.get(state.mode,'')} *{state.mode.upper()}*",parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_tf(update,ctx):
-    valid=["1m","5m","15m","1h","4h","1d"]
-    if not ctx.args or ctx.args[0] not in valid:
-        await update.message.reply_text(f"Usage: `/tf 1h`\nOptions: `{'` · `'.join(valid)}`",parse_mode=ParseMode.MARKDOWN); return
-    state.active_tf=ctx.args[0]; state.save()
-    await update.message.reply_text(f"✅ TF → `{state.active_tf}`",parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_watch(u,c):
-    if not state.watchlist: await u.message.reply_text("📋 Empty.",parse_mode=ParseMode.MARKDOWN); return
-    coins="  ·  ".join(f"`{s2coin(s)}`" for s in state.watchlist)
-    await u.message.reply_text(f"📋 *Watchlist ({len(state.watchlist)}/{MAX_WATCHLIST})*\n\n{coins}",parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_add(update,ctx):
-    if not ctx.args: await update.message.reply_text("Usage: `/add BTC`",parse_mode=ParseMode.MARKDOWN); return
-    coin=ctx.args[0].upper().replace("USDT","").strip("/")
-    if not is_valid_coin(coin): await update.message.reply_text("❌ Invalid.",parse_mode=ParseMode.MARKDOWN); return
-    sym=coin2s(coin)
-    if sym in state.watchlist: await update.message.reply_text(f"`{coin}` already in list.",parse_mode=ParseMode.MARKDOWN); return
-    if len(state.watchlist)>=MAX_WATCHLIST: await update.message.reply_text(f"❌ Full.",parse_mode=ParseMode.MARKDOWN); return
-    state.watchlist.append(sym); state.save()
-    await update.message.reply_text(f"✅ `{coin}` added!",parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_remove(update,ctx):
-    if not ctx.args: await update.message.reply_text("Usage: `/remove BTC`",parse_mode=ParseMode.MARKDOWN); return
-    sym=coin2s(ctx.args[0].upper().replace("USDT","").strip("/"))
-    if sym not in state.watchlist: await update.message.reply_text("Not found.",parse_mode=ParseMode.MARKDOWN); return
-    state.watchlist.remove(sym); state.save()
-    await update.message.reply_text("🗑 Removed.",parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_alert(update,ctx):
-    if len(ctx.args)<3: await update.message.reply_text("Usage: `/alert BTC 70000 above`",parse_mode=ParseMode.MARKDOWN); return
-    coin=ctx.args[0].upper().replace("USDT","").strip("/")
-    if not is_valid_coin(coin): return
-    sym=coin2s(coin)
-    try: target=float(ctx.args[1].replace(",","")); assert target>0
-    except: await update.message.reply_text("❌ Valid price দাও।",parse_mode=ParseMode.MARKDOWN); return
-    d=ctx.args[2].lower()
-    if d not in ("above","below"): await update.message.reply_text("`above` বা `below` দাও।",parse_mode=ParseMode.MARKDOWN); return
-    for a in state.price_alerts[sym]:
-        if a["target"]==target and a["direction"]==d: await update.message.reply_text("⚠️ Already exists.",parse_mode=ParseMode.MARKDOWN); return
-    state.price_alerts[sym].append({"target":target,"direction":d}); state.save()
-    await update.message.reply_text(f"🔔 {'📈' if d=='above' else '📉'} *{coin}* {d} `${target:,.2f}`",parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_alerts(update,ctx):
-    active={s:al for s,al in state.price_alerts.items() if al}
-    if not active: await update.message.reply_text("কোনো alert নেই।",parse_mode=ParseMode.MARKDOWN); return
-    lines=["🔔 *Active Alerts*\n"]
-    for sym,al_list in active.items():
-        for a in al_list: lines.append(f"{'📈' if a['direction']=='above' else '📉'} *{s2coin(sym)}* {a['direction']} `${a['target']:,.2f}`")
-    await update.message.reply_text("\n".join(lines),parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_cancelalert(update,ctx):
-    if not ctx.args: await update.message.reply_text("Usage: `/cancelalert BTC`",parse_mode=ParseMode.MARKDOWN); return
-    sym=coin2s(ctx.args[0].upper().replace("USDT","").strip("/"))
-    if state.price_alerts.get(sym): state.price_alerts[sym].clear(); state.save(); await update.message.reply_text("✅ Removed.",parse_mode=ParseMode.MARKDOWN)
-    else: await update.message.reply_text("কোনো alert নেই।",parse_mode=ParseMode.MARKDOWN)
-
-async def cmd_threshold(update,ctx):
-    if len(ctx.args)<2:
-        await update.message.reply_text(f"RSI: BUY<`{state.rsi_buy}` · SELL>`{state.rsi_sell}`\nChange: `/threshold 25 75`",parse_mode=ParseMode.MARKDOWN); return
-    try:
-        b,s=int(ctx.args[0]),int(ctx.args[1]); assert 0<b<s<100
-        state.rsi_buy,state.rsi_sell=b,s; state.save()
-        await update.message.reply_text(f"✅ RSI: 🟢<`{b}` 🔴>`{s}`",parse_mode=ParseMode.MARKDOWN)
-    except: await update.message.reply_text("❌ Example: `/threshold 25 75`",parse_mode=ParseMode.MARKDOWN)
-
-async def handle_text(update,ctx):
-    raw=update.message.text.strip().upper().replace("USDT","").strip("/")
-    if is_valid_coin(raw): ctx.args=[raw]; await cmd_analyze(update,ctx)
-    else: await update.message.reply_text("`BTC` বা `/help`",parse_mode=ParseMode.MARKDOWN)
-
-async def handle_buttons(update,ctx):
-    q=update.callback_query; data=q.data or ""; await q.answer()
-    if data.startswith("quick_"):
-        coin=data[6:].upper()
-        if not is_valid_coin(coin): return
-        wait=await q.message.reply_text(f"⏳ *{coin}* analyze করছি...",parse_mode=ParseMode.MARKDOWN)
-        sig=await run_analysis(coin2s(coin))
-        if not sig: await wait.edit_text("❌ Error.",parse_mode=ParseMode.MARKDOWN); return
-        kb=[[InlineKeyboardButton("🔄 Refresh",callback_data=f"quick_{coin}"),
-             InlineKeyboardButton("🔔 Alert",  callback_data=f"alertmenu_{coin}")]]
-        await wait.edit_text(fmt_signal(coin2s(coin),sig),parse_mode=ParseMode.MARKDOWN,reply_markup=InlineKeyboardMarkup(kb))
-        if sig.get("exit_signal"): await q.message.reply_text(fmt_exit(coin2s(coin),sig),parse_mode=ParseMode.MARKDOWN)
-    elif data=="scan":   update.message=q.message; await cmd_scan(update,ctx)
-    elif data=="watch":  update.message=q.message; await cmd_watch(update,ctx)
-    elif data=="alerts": update.message=q.message; await cmd_alerts(update,ctx)
-    elif data=="help":   await q.message.reply_text(HELP_TEXT,parse_mode=ParseMode.MARKDOWN)
-    elif data=="settings":
-        cfg=MODES[state.mode]
-        await q.message.reply_text(
-            f"⚙️ *Settings*\nMode: {MODE_ICON.get(state.mode,'')} `{state.mode.upper()}`\n"
-            f"TF: `{state.active_tf}` + `{CONFIRM_TF}` MTF\n"
-            f"RSI: BUY<`{state.rsi_buy}` SELL>`{state.rsi_sell}`\n"
-            f"Min score: `{cfg['min_score']}/12`\n"
-            f"SL:`{cfg['atr_sl']}×ATR` TP1:`{cfg['atr_tp1']}×ATR` TP2:`{cfg['atr_tp2']}×ATR`",
-            parse_mode=ParseMode.MARKDOWN)
-    elif data.startswith("alertmenu_"):
-        coin=data[10:].upper()
-        if not is_valid_coin(coin): return
-        price=await fetch_price(coin2s(coin))
-        hint=f"`${price:,.4f}`" if price else "N/A"
-        up=int(price*1.05) if price else "TARGET"; dn=int(price*0.95) if price else "TARGET"
-        await q.message.reply_text(
-            f"🔔 *{coin} Alert*\nNow: {hint}\n\n"
-            f"`/alert {coin} {up} above` _(+5%)_\n`/alert {coin} {dn} below` _(-5%)_",
-            parse_mode=ParseMode.MARKDOWN)
-
-# ══════════════════════════════════════════════════════════════════════
-#  ⏰  JOBS
-# ══════════════════════════════════════════════════════════════════════
-
-async def job_auto_scan(bot):
-    if not state.watchlist: return
-    log.info("Auto scan...")
-    min_s   = MODES[state.mode]["min_score"]
-    rows    = []
-    signals = []
-
-    for symbol in state.watchlist:
-        sig = await run_analysis(symbol)
-        if not sig: continue
-        rows.append(fmt_scan_row(symbol, sig))
-        if abs(sig["score"]) >= min_s and sig["composite"] != "NEUTRAL":
-            signals.append((symbol, sig))
-
-    signals.sort(key=lambda x: abs(x[1]["score"]), reverse=True)
-    summary = fmt_scan_summary(rows, signals, state.active_tf, state.mode)
-    await bot.send_message(CHAT_ID, summary, parse_mode=ParseMode.MARKDOWN)
-
-    for symbol, sig in signals:
-        await bot.send_message(
-            CHAT_ID, fmt_signal(symbol, sig), parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Refresh", callback_data=f"quick_{s2coin(symbol)}"),
-                InlineKeyboardButton("🔔 Alert",   callback_data=f"alertmenu_{s2coin(symbol)}"),
-            ]])
-        )
-        if sig.get("exit_signal"):
-            await bot.send_message(CHAT_ID, fmt_exit(symbol, sig), parse_mode=ParseMode.MARKDOWN)
-
-    log.info(f"Done — {len(signals)} signal(s).")
-
-
-async def job_check_alerts(bot):
-    for symbol, al_list in list(state.price_alerts.items()):
-        if not al_list: continue
-        price = await fetch_price(symbol)
-        if price is None: continue
-        coin = s2coin(symbol); changed = False
-        for a in list(al_list):
-            hit = (
-                (a["direction"]=="above" and price >= a["target"]) or
-                (a["direction"]=="below" and price <= a["target"])
+        
+        if signal.get("exit_signal"):
+            await update.message.reply_text(
+                format_exit_message(symbol, signal),
+                parse_mode=ParseMode.MARKDOWN
             )
-            if hit:
+
+async def mode_command(update, context):
+    if not context.args or context.args[0].lower() not in MODES:
+        lines = ["*Signal Modes:*\n"]
+        for name, config in MODES.items():
+            active_marker = " ← active" if name == state.mode else ""
+            lines.append(
+                f"{MODE_ICONS.get(name, '')} *{name.upper()}*{active_marker}\n"
+                f"  Score≥`{config['min_score']}/12` SL:`{config['atr_sl']}×ATR`"
+            )
+        await update.message.reply_text(
+            "\n".join(lines) + "\n\nChange mode: `/mode sensitive`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    state.mode = context.args[0].lower()
+    state.save()
+    await update.message.reply_text(
+        f"✅ Mode changed to {MODE_ICONS.get(state.mode, '')} *{state.mode.upper()}*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def timeframe_command(update, context):
+    valid_timeframes = ["1m", "5m", "15m", "1h", "4h", "1d"]
+    
+    if not context.args or context.args[0] not in valid_timeframes:
+        await update.message.reply_text(
+            f"Usage: `/tf 1h`\nOptions: `{'` · `'.join(valid_timeframes)}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    state.active_tf = context.args[0]
+    state.save()
+    await update.message.reply_text(
+        f"✅ Timeframe changed to `{state.active_tf}`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def watchlist_command(update, context):
+    if not state.watchlist:
+        await update.message.reply_text("📋 Watchlist is empty.", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    coins = "  ·  ".join(f"`{symbol_to_coin(s)}`" for s in state.watchlist)
+    await update.message.reply_text(
+        f"📋 *Watchlist ({len(state.watchlist)}/{MAX_WATCHLIST})*\n\n{coins}",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def add_command(update, context):
+    if not context.args:
+        await update.message.reply_text("Usage: `/add BTC`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    coin = context.args[0].upper().replace("USDT", "").strip("/")
+    if not is_valid_coin(coin):
+        await update.message.reply_text("❌ Invalid coin symbol.", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    symbol = coin_to_symbol(coin)
+    
+    if symbol in state.watchlist:
+        await update.message.reply_text(f"`{coin}` already in watchlist.", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    if len(state.watchlist) >= MAX_WATCHLIST:
+        await update.message.reply_text(f"❌ Watchlist full (max {MAX_WATCHLIST}).", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    state.watchlist.append(symbol)
+    state.save()
+    await update.message.reply_text(f"✅ `{coin}` added to watchlist!", parse_mode=ParseMode.MARKDOWN)
+
+async def remove_command(update, context):
+    if not context.args:
+        await update.message.reply_text("Usage: `/remove BTC`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    symbol = coin_to_symbol(context.args[0].upper().replace("USDT", "").strip("/"))
+    
+    if symbol not in state.watchlist:
+        await update.message.reply_text("Coin not found in watchlist.", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    state.watchlist.remove(symbol)
+    state.save()
+    await update.message.reply_text("🗑 Removed from watchlist.", parse_mode=ParseMode.MARKDOWN)
+
+async def alert_command(update, context):
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Usage: `/alert BTC 70000 above`\n`/alert ETH 2500 below`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    coin = context.args[0].upper().replace("USDT", "").strip("/")
+    if not is_valid_coin(coin):
+        return
+    
+    symbol = coin_to_symbol(coin)
+    
+    try:
+        target_price = float(context.args[1].replace(",", ""))
+        assert target_price > 0
+    except:
+        await update.message.reply_text("❌ Please provide a valid price.", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    direction = context.args[2].lower()
+    if direction not in ("above", "below"):
+        await update.message.reply_text("Please specify `above` or `below`.", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    # Check if alert already exists
+    for alert in state.price_alerts[symbol]:
+        if alert["target"] == target_price and alert["direction"] == direction:
+            await update.message.reply_text("⚠️ Alert already exists.", parse_mode=ParseMode.MARKDOWN)
+            return
+    
+    state.price_alerts[symbol].append({"target": target_price, "direction": direction})
+    state.save()
+    
+    direction_icon = "📈" if direction == "above" else "📉"
+    await update.message.reply_text(
+        f"🔔 {direction_icon} Alert set for *{coin}* {direction} `${target_price:,.2f}`",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def alerts_command(update, context):
+    active_alerts = {symbol: alerts for symbol, alerts in state.price_alerts.items() if alerts}
+    
+    if not active_alerts:
+        await update.message.reply_text("No active alerts.", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    lines = ["🔔 *Active Alerts*\n"]
+    for symbol, alert_list in active_alerts.items():
+        for alert in alert_list:
+            direction_icon = "📈" if alert["direction"] == "above" else "📉"
+            lines.append(
+                f"{direction_icon} *{symbol_to_coin(symbol)}* {alert['direction']} `${alert['target']:,.2f}`"
+            )
+    
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def cancel_alert_command(update, context):
+    if not context.args:
+        await update.message.reply_text("Usage: `/cancelalert BTC`", parse_mode=ParseMode.MARKDOWN)
+        return
+    
+    symbol = coin_to_symbol(context.args[0].upper().replace("USDT", "").strip("/"))
+    
+    if state.price_alerts.get(symbol):
+        state.price_alerts[symbol].clear()
+        state.save()
+        await update.message.reply_text("✅ All alerts for this coin removed.", parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text("No alerts found for this coin.", parse_mode=ParseMode.MARKDOWN)
+
+async def threshold_command(update, context):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            f"Current RSI: BUY < `{state.rsi_buy}` · SELL > `{state.rsi_sell}`\n"
+            f"Change: `/threshold 25 75`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    try:
+        buy_level = int(context.args[0])
+        sell_level = int(context.args[1])
+        assert 0 < buy_level < sell_level < 100
+        
+        state.rsi_buy = buy_level
+        state.rsi_sell = sell_level
+        state.save()
+        
+        await update.message.reply_text(
+            f"✅ RSI thresholds updated: 🟢 < `{buy_level}` 🔴 > `{sell_level}`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except:
+        await update.message.reply_text(
+            "❌ Invalid values. Example: `/threshold 25 75`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+async def handle_text_message(update, context):
+    raw_text = update.message.text.strip().upper().replace("USDT", "").strip("/")
+    
+    if is_valid_coin(raw_text):
+        context.args = [raw_text]
+        await analyze_command(update, context)
+    else:
+        await update.message.reply_text(
+            "Type a coin symbol like `BTC` or use `/help`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+async def handle_button_callbacks(update, context):
+    query = update.callback_query
+    data = query.data or ""
+    await query.answer()
+    
+    if data.startswith("quick_"):
+        coin = data[6:].upper()
+        if not is_valid_coin(coin):
+            return
+        
+        waiting_message = await query.message.reply_text(
+            f"⏳ Analyzing *{coin}*...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        signal = await run_analysis(coin_to_symbol(coin))
+        if not signal:
+            await waiting_message.edit_text("❌ Error fetching data.", parse_mode=ParseMode.MARKDOWN)
+            return
+        
+        keyboard = [[
+            InlineKeyboardButton("🔄 Refresh", callback_data=f"quick_{coin}"),
+            InlineKeyboardButton("🔔 Alert", callback_data=f"alertmenu_{coin}")
+        ]]
+        
+        await waiting_message.edit_text(
+            format_signal_message(coin_to_symbol(coin), signal),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        if signal.get("exit_signal"):
+            await query.message.reply_text(
+                format_exit_message(coin_to_symbol(coin), signal),
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    elif data == "scan":
+        update.message = query.message
+        await scan_command(update, context)
+    
+    elif data == "watch":
+        update.message = query.message
+        await watchlist_command(update, context)
+    
+    elif data == "alerts":
+        update.message = query.message
+        await alerts_command(update, context)
+    
+    elif data == "help":
+        await query.message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+    
+    elif data == "settings":
+        config = MODES[state.mode]
+        await query.message.reply_text(
+            f"⚙️ *Settings*\n"
+            f"Mode: {MODE_ICONS.get(state.mode, '')} `{state.mode.upper()}`\n"
+            f"TF: `{state.active_tf}` + `{CONFIRM_TF}` MTF\n"
+            f"RSI: BUY < `{state.rsi_buy}` SELL > `{state.rsi_sell}`\n"
+            f"Min score: `{config['min_score']}/12`\n"
+            f"SL: `{config['atr_sl']}×ATR` TP1: `{config['atr_tp1']}×ATR` TP2: `{config['atr_tp2']}×ATR`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif data.startswith("alertmenu_"):
+        coin = data[10:].upper()
+        if not is_valid_coin(coin):
+            return
+        
+        current_price = await fetch_price(coin_to_symbol(coin))
+        price_hint = f"`${current_price:,.4f}`" if current_price else "N/A"
+        
+        # Suggest 5% above/below current price
+        if current_price:
+            above_target = int(current_price * 1.05)
+            below_target = int(current_price * 0.95)
+        else:
+            above_target = "TARGET"
+            below_target = "TARGET"
+        
+        await query.message.reply_text(
+            f"🔔 *{coin} Alert*\nCurrent: {price_hint}\n\n"
+            f"`/alert {coin} {above_target} above` _(+5%)_\n"
+            f"`/alert {coin} {below_target} below` _(-5%)_",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+# ══════════════════════════════════════════════════════════════════════
+#  ⏰  SCHEDULED JOBS
+# ══════════════════════════════════════════════════════════════════════
+
+async def auto_scan_job(bot):
+    if not state.watchlist:
+        return
+    
+    log.info("Running auto scan...")
+    min_score = MODES[state.mode]["min_score"]
+    rows = []
+    actionable_signals = []
+    
+    for symbol in state.watchlist:
+        signal = await run_analysis(symbol)
+        if not signal:
+            continue
+        
+        rows.append(format_scan_row(symbol, signal))
+        
+        if abs(signal["adjusted_score"]) >= min_score and signal["composite"] != "NEUTRAL":
+            actionable_signals.append((symbol, signal))
+    
+    actionable_signals.sort(key=lambda x: abs(x[1]["adjusted_score"]), reverse=True)
+    
+    summary = format_scan_summary(rows, actionable_signals, state.active_tf, state.mode)
+    await bot.send_message(CHAT_ID, summary, parse_mode=ParseMode.MARKDOWN)
+    
+    for symbol, signal in actionable_signals:
+        await bot.send_message(
+            CHAT_ID,
+            format_signal_message(symbol, signal),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔄 Refresh", callback_data=f"quick_{symbol_to_coin(symbol)}"),
+                InlineKeyboardButton("🔔 Alert", callback_data=f"alertmenu_{symbol_to_coin(symbol)}"),
+            ]])
+        )
+        
+        if signal.get("exit_signal"):
+            await bot.send_message(
+                CHAT_ID,
+                format_exit_message(symbol, signal),
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    log.info(f"Auto scan complete — {len(actionable_signals)} signal(s).")
+
+
+async def check_alerts_job(bot):
+    for symbol, alert_list in list(state.price_alerts.items()):
+        if not alert_list:
+            continue
+        
+        current_price = await fetch_price(symbol)
+        if current_price is None:
+            continue
+        
+        coin = symbol_to_coin(symbol)
+        changed = False
+        
+        for alert in list(alert_list):
+            hit_alert = (
+                (alert["direction"] == "above" and current_price >= alert["target"]) or
+                (alert["direction"] == "below" and current_price <= alert["target"])
+            )
+            
+            if hit_alert:
                 # Get current signal for context
-                sig = await run_analysis(symbol)
-                msg = fmt_price_alert(symbol, price, a["target"], a["direction"], sig)
-                await bot.send_message(CHAT_ID, msg, parse_mode=ParseMode.MARKDOWN)
-                al_list.remove(a); changed = True
-        if changed: state.save()
+                signal = await run_analysis(symbol)
+                alert_message = format_price_alert(symbol, current_price, alert["target"], alert["direction"], signal)
+                await bot.send_message(CHAT_ID, alert_message, parse_mode=ParseMode.MARKDOWN)
+                alert_list.remove(alert)
+                changed = True
+        
+        if changed:
+            state.save()
 
 # ══════════════════════════════════════════════════════════════════════
 #  ⏰  PURE ASYNCIO SCHEDULER (no apscheduler needed)
 # ══════════════════════════════════════════════════════════════════════
 
-async def _schedule_loop(bot: Bot):
+async def scheduler_loop(bot: Bot):
     """
     Runs forever in the background.
     Checks every minute if it's time to scan or check alerts.
@@ -1036,62 +1524,84 @@ async def _schedule_loop(bot: Bot):
     """
     last_alert_check = datetime.utcnow()
     log.info(f"⏰ Scheduler running — Scans: {SCAN_TIMES} UTC, Alerts every {ALERT_CHECK_MINS}m")
-
+    
     while True:
-        await asyncio.sleep(30)  # check every 30 seconds
+        await asyncio.sleep(30)  # Check every 30 seconds
         now = datetime.utcnow()
-
+        
         # Check price alerts
-        diff_mins = (now - last_alert_check).total_seconds() / 60
-        if diff_mins >= ALERT_CHECK_MINS:
+        minutes_since_last_check = (now - last_alert_check).total_seconds() / 60
+        if minutes_since_last_check >= ALERT_CHECK_MINS:
             last_alert_check = now
             try:
-                await job_check_alerts(bot)
+                await check_alerts_job(bot)
             except Exception as e:
                 log.error(f"Alert check error: {e}")
-
+        
         # Check scan schedule
-        hhmm = now.strftime("%H:%M")
-        if hhmm in SCAN_TIMES and now.second < 30:
+        current_time_str = now.strftime("%H:%M")
+        if current_time_str in SCAN_TIMES and now.second < 30:
             try:
-                await job_auto_scan(bot)
-                await asyncio.sleep(61)  # prevent double-trigger within same minute
+                await auto_scan_job(bot)
+                await asyncio.sleep(61)  # Prevent double-trigger within same minute
             except Exception as e:
                 log.error(f"Auto scan error: {e}")
-
 
 # ══════════════════════════════════════════════════════════════════════
 #  🚀  MAIN
 # ══════════════════════════════════════════════════════════════════════
 
-async def post_init(app):
-    asyncio.create_task(_schedule_loop(app.bot))
-    log.info(f"✅ Scheduler started — Scans: {SCAN_TIMES} UTC")
+async def post_initialization(app):
+    asyncio.create_task(scheduler_loop(app.bot))
+    log.info(f"✅ Scheduler started — Scan times: {SCAN_TIMES} UTC")
 
-async def post_shutdown(app):
+async def pre_shutdown(app):
     await exchange.close()
-    log.info("Stopped.")
+    log.info("Exchange connection closed.")
 
 def main():
-    if BOT_TOKEN=="YOUR_BOT_TOKEN_HERE": print("\n❌  BOT_TOKEN এবং CHAT_ID বসাও!\n"); return
-    if not isinstance(CHAT_ID,int) or CHAT_ID<=0: print("\n❌  CHAT_ID must be integer!\n"); return
+    if BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+        print("\n❌ Please set your BOT_TOKEN and CHAT_ID in the config section!\n")
+        return
+    
+    if not isinstance(CHAT_ID, int) or CHAT_ID <= 0:
+        print("\n❌ CHAT_ID must be a positive integer!\n")
+        return
+    
     state.load()
-    log.info(f"📡 Signal Bot — {state.mode.upper()} · TF={state.active_tf} · {len(state.watchlist)} coins")
-    app=(Application.builder()
-         .token(BOT_TOKEN)
-         .post_init(post_init)
-         .post_shutdown(post_shutdown)
-         .build())
-    for cmd,fn in [("start",cmd_start),("help",cmd_help),("analyze",cmd_analyze),
-                   ("scan",cmd_scan),("mode",cmd_mode),("tf",cmd_tf),
-                   ("watch",cmd_watch),("add",cmd_add),("remove",cmd_remove),
-                   ("alert",cmd_alert),("alerts",cmd_alerts),("cancelalert",cmd_cancelalert),
-                   ("threshold",cmd_threshold)]:
-        app.add_handler(CommandHandler(cmd,fn))
-    app.add_handler(CallbackQueryHandler(handle_buttons))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,handle_text))
-    log.info("✅ Bot live!")
+    log.info(f"📡 Signal Bot — {state.mode.upper()} mode · TF={state.active_tf} · {len(state.watchlist)} coins")
+    
+    app = (Application.builder()
+           .token(BOT_TOKEN)
+           .post_init(post_initialization)
+           .post_shutdown(pre_shutdown)
+           .build())
+    
+    # Register command handlers
+    commands = [
+        ("start", start_command),
+        ("help", help_command),
+        ("analyze", analyze_command),
+        ("scan", scan_command),
+        ("mode", mode_command),
+        ("tf", timeframe_command),
+        ("watch", watchlist_command),
+        ("add", add_command),
+        ("remove", remove_command),
+        ("alert", alert_command),
+        ("alerts", alerts_command),
+        ("cancelalert", cancel_alert_command),
+        ("threshold", threshold_command),
+    ]
+    
+    for cmd_name, handler_func in commands:
+        app.add_handler(CommandHandler(cmd_name, handler_func))
+    
+    app.add_handler(CallbackQueryHandler(handle_button_callbacks))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
+    
+    log.info("✅ Bot is now live!")
     app.run_polling(drop_pending_updates=True)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
