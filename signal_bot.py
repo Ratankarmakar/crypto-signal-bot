@@ -38,8 +38,8 @@ print("✅ All packages ready!")
 #  ⚙️  CONFIG — শুধু এই ২টা line edit করো
 # ══════════════════════════════════════════════════════════════════════
 
-BOT_TOKEN = "8436225888:AAFjWIQgLH4vhsgtHCVJW4ReMEmtUcxNUDc"   # @BotFather থেকে নাও
-CHAT_ID   = 6537100940               # @userinfobot থেকে নাও (integer)
+BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"   # @BotFather থেকে নাও
+CHAT_ID   = 0  # Replace with your chat ID               # @userinfobot থেকে নাও (integer)
 
 DEFAULT_WATCHLIST = [
     "BTC/USDT", "ETH/USDT", "SOL/USDT",
